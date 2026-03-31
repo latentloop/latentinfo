@@ -1,0 +1,150 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: 'IBM Plex Sans', -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'SF Mono', monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius: 0.5rem;
+}
+
+:root {
+  --background: #111110;
+  --foreground: #e8e6e1;
+  --card: #191918;
+  --card-foreground: #e8e6e1;
+  --popover: #191918;
+  --popover-foreground: #e8e6e1;
+  --primary: #e8e6e1;
+  --primary-foreground: #111110;
+  --secondary: #222221;
+  --secondary-foreground: #b5b3ae;
+  --muted: #2a2a28;
+  --muted-foreground: #87857f;
+  --accent: #2a2a28;
+  --accent-foreground: #e8e6e1;
+  --destructive: #b85c5c;
+  --destructive-foreground: #e8e6e1;
+  --border: #2a2a28;
+  --input: #2a2a28;
+  --ring: #c8a455;
+  --chart-1: #c8a455;
+  --chart-2: #5a9a6a;
+  --chart-3: #5a7fa8;
+  --chart-4: #b85c5c;
+  --chart-5: #87857f;
+}
+
+* {
+  border-color: var(--border);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+/* Global thin scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--muted-foreground) transparent;
+}
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--muted-foreground); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--ring); }
+
+/* x_x data visualizer color scheme */
+.x-theme {
+  --background: #0d1117;
+  --foreground: #e6edf3;
+  --card: #1c2128;
+  --card-foreground: #e6edf3;
+  --border: #30363d;
+  --muted: #161b22;
+  --muted-foreground: #8b949e;
+  --accent: #58a6ff;
+  --ring: #58a6ff;
+  background: #0d1117;
+  color: #e6edf3;
+}
+
+.x-grid {
+  grid-template-columns: repeat(auto-fill, minmax(440px, 1fr));
+  max-width: 1920px;
+  margin: 0 auto;
+}
+@media (min-width: 1800px) {
+  .x-grid {
+    max-width: none;
+    grid-template-columns: repeat(auto-fill, minmax(560px, 1fr));
+  }
+}
+
+.x-card {
+  background: #1c2128;
+  border-color: #30363d;
+  transition: border-color 0.15s, background 0.15s;
+}
+.x-card:hover {
+  background: #262c36;
+  border-color: #58a6ff;
+}
+
+/* macOS Electron title bar drag region */
+.app-drag-region {
+  -webkit-app-region: drag;
+}
+.app-drag-region a,
+.app-drag-region button {
+  -webkit-app-region: no-drag;
+}
+
+/* Scrollable group columns — matches x_x .group-column scrollbar */
+.group-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--muted-foreground) transparent;
+}
+.group-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.group-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.group-scroll::-webkit-scrollbar-thumb {
+  background: var(--muted-foreground);
+  border-radius: 3px;
+}
+.group-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--ring);
+}
+.group-scroll::-webkit-scrollbar-thumb:active {
+  background: hsl(var(--ring) / 0.7);
+}

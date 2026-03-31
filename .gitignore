@@ -1,0 +1,43 @@
+node_modules/
+dist/
+.turbo/
+packages/gui/release/
+tmp/
+
+# local packages
+packages/gui-test
+docs/
+
+# TypeScript build output (generated alongside source files)
+packages/**/*.js
+packages/**/*.js.map
+packages/**/*.d.ts
+packages/**/*.d.ts.map
+# Keep hand-written type declarations
+!packages/**/types/**/*.d.ts
+.env
+.env.*
+*.log
+.DS_Store
+.vscode/
+.idea/
+.context/
+*.tsbuildinfo
+review.json
+
+# TanStack Router generated files
+.tanstack/
+
+# Playwright
+test-results/
+playwright-report/
+
+# Electron
+out/
+
+# OS
+Thumbs.db
+
+# LibSQL
+*.db
+*.db-journal

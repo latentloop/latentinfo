@@ -1,0 +1,28 @@
+{
+  "name": "gui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/main.ts",
+  "scripts": {
+    "build": "tsc --build",
+    "dev": "echo '⚠ Do not run directly — use pnpm dev:all from root (needs Vite running first)' && electronmon --import=tsx/esm . --remote-debugging-port=9223",
+    "check-types": "tsc --noEmit",
+    "lint": "echo 'no lint configured'",
+    "pack": "electron-builder --mac"
+  },
+  "electronmon": {
+    "patterns": ["src/**/*"],
+    "logLevel": "info"
+  },
+  "dependencies": {
+    "electron-is-dev": "^3.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.4.0",
+    "electron": "^41.1.0",
+    "electron-builder": "^25.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "5.9.3"
+  }
+}
