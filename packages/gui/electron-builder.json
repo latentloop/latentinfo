@@ -10,13 +10,14 @@
     "category": "public.app-category.developer-tools"
   },
   "files": [
-    "dist/**/*"
+    "dist/**/*",
+    "icons/**/*"
   ],
   "extraResources": [
     {
-      "from": "../backend/dist",
+      "from": ".backend-bundle",
       "to": "backend",
-      "filter": ["**/*"]
+      "filter": ["dist/**/*.js", "node_modules/**/*", "package.json"]
     },
     {
       "from": "../frontend/dist",

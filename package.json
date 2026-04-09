@@ -9,7 +9,7 @@
     "dev:all": "echo '▶ Full GUI: Vite + Electron (backend spawned by Electron)' && pnpm dev:kill && pnpm --filter frontend build && concurrently -k -n vite,electron \"pnpm --filter frontend dev\" \"wait-on tcp:5173 && pnpm --filter gui dev\"",
     "lint": "turbo run lint",
     "check-types": "turbo run check-types",
-    "package": "turbo run build --filter=frontend --filter=backend --filter=gui && pnpm --filter gui run pack"
+    "package": "bash scripts/package.sh"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

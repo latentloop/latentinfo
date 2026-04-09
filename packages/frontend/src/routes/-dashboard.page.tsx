@@ -623,7 +623,7 @@ function CollectorRow({ collector: c, onConfigChange }: {
         )}
         {c.config.freshMinutes != null ? (
           <div className="inline-flex items-center gap-2 text-xs text-muted-foreground">
-            <span className="whitespace-nowrap">Skip if collected within</span>
+            <span className="whitespace-nowrap">DOWN key skip tweets collected older than</span>
             <div className="inline-flex items-center rounded-md border border-border overflow-hidden h-8">
               <button
                 type="button"

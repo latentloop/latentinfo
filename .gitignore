@@ -34,6 +34,7 @@ playwright-report/
 
 # Electron
 out/
+packages/gui/.backend-bundle/
 
 # OS
 Thumbs.db

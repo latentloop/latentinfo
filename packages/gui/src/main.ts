@@ -77,10 +77,14 @@ function spawnBackend(): ChildProcess {
   let args: string[]
 
   if (isPackaged) {
-    // Production: backend is bundled into resources, use system node
-    const backendEntry = join(process.resourcesPath, "backend", "index.js")
+    // Production: backend is bundled into resources, use Electron's bundled Node.js
+    const backendEntry = join(process.resourcesPath, "backend", "dist", "index.js")
+    if (!existsSync(backendEntry)) {
+      dialog.showErrorBox("Backend Missing", `Backend not found at:\n${backendEntry}`)
+      app.quit()
+    }
     const frontendDir = join(process.resourcesPath, "frontend")
-    command = "node"
+    command = process.execPath
     args = [backendEntry, "--static-dir", frontendDir]
   } else {
     // Development: use tsx to run TypeScript source directly
@@ -99,11 +103,18 @@ function spawnBackend(): ChildProcess {
     }
   }
 
+  // When reusing the Electron binary as a Node runtime, ELECTRON_RUN_AS_NODE
+  // must be set; in dev mode explicitly clear it to prevent env inheritance.
+  const backendEnv = {
+    ...process.env,
+    ELECTRON_RUN_AS_NODE: isPackaged ? "1" : "",
+  }
+
   console.log(`[gui] Spawning backend: ${command} ${args.join(" ")}`)
 
   const child = spawn(command, args, {
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env },
+    env: backendEnv,
   })
 
   child.stdout?.on("data", (data: Buffer) => {
@@ -164,6 +175,7 @@ function checkHealth(): Promise<boolean> {
 async function waitForBackend(): Promise<boolean> {
   const start = Date.now()
   while (Date.now() - start < HEALTH_TIMEOUT_MS) {
+    if (!backendProcess) return false // process already exited
     const ok = await checkHealth()
     if (ok) return true
     await new Promise((r) => setTimeout(r, HEALTH_POLL_INTERVAL_MS))
