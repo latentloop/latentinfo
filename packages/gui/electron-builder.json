@@ -7,7 +7,8 @@
   },
   "mac": {
     "target": ["dmg", "zip"],
-    "category": "public.app-category.developer-tools"
+    "category": "public.app-category.developer-tools",
+    "electronLanguages": ["en"]
   },
   "files": [
     "dist/**/*",
@@ -17,7 +18,7 @@
     {
       "from": ".backend-bundle",
       "to": "backend",
-      "filter": ["dist/**/*.js", "node_modules/**/*", "package.json"]
+      "filter": ["dist/**/*.mjs", "node_modules/**/*", "package.json"]
     },
     {
       "from": "../frontend/dist",
@@ -25,6 +26,7 @@
       "filter": ["**/*"]
     }
   ],
+  "afterPack": "./scripts/afterPack.cjs",
   "directories": {
     "buildResources": "build",
     "output": "release"

@@ -78,7 +78,7 @@ function spawnBackend(): ChildProcess {
 
   if (isPackaged) {
     // Production: backend is bundled into resources, use Electron's bundled Node.js
-    const backendEntry = join(process.resourcesPath, "backend", "dist", "index.js")
+    const backendEntry = join(process.resourcesPath, "backend", "dist", "bundle.mjs")
     if (!existsSync(backendEntry)) {
       dialog.showErrorBox("Backend Missing", `Backend not found at:\n${backendEntry}`)
       app.quit()

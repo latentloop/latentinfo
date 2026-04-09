@@ -1,7 +1,9 @@
 /**
  * Logging module.
  *
- * Uses pino with pino-pretty for human-readable output.
+ * In development: uses pino-pretty for human-readable output (loaded from devDependencies).
+ * In production (packaged app): uses pino.multistream with pino.destination for
+ * synchronous stdout + file output (no worker threads, bundle-friendly).
  * Log level is read from settings.json (default: "warn").
  */
 
@@ -67,40 +69,70 @@ function getBackendLogPath(): string {
   return logPath
 }
 
+function hasPinoPretty(): boolean {
+  try {
+    require.resolve("pino-pretty")
+    return true
+  } catch {
+    return false
+  }
+}
+
 const level = readLogLevel()
 const backendLogFile = getBackendLogPath()
 
-const logger = pino({
-  level,
-  base: undefined,
-  timestamp: pino.stdTimeFunctions.isoTime,
-  transport: {
-    targets: [
-      {
-        target: "pino-pretty",
-        level,
-        options: {
-          colorize: true,
-          translateTime: "HH:MM:ss.l",
-          ignore: "pid,hostname",
-          singleLine: true,
-        },
+function buildLogger(): pino.Logger {
+  if (hasPinoPretty()) {
+    // Development: use pino-pretty via transport (worker threads — fine when running from source)
+    return pino({
+      level,
+      base: undefined,
+      timestamp: pino.stdTimeFunctions.isoTime,
+      transport: {
+        targets: [
+          {
+            target: "pino-pretty",
+            level,
+            options: {
+              colorize: true,
+              translateTime: "HH:MM:ss.l",
+              ignore: "pid,hostname",
+              singleLine: true,
+            },
+          },
+          {
+            target: "pino-pretty",
+            level,
+            options: {
+              colorize: false,
+              translateTime: "yyyy-mm-dd HH:MM:ss.l",
+              ignore: "pid,hostname",
+              singleLine: true,
+              destination: backendLogFile,
+              mkdir: true,
+            },
+          },
+        ],
       },
-      {
-        target: "pino-pretty",
-        level,
-        options: {
-          colorize: false,
-          translateTime: "yyyy-mm-dd HH:MM:ss.l",
-          ignore: "pid,hostname",
-          singleLine: true,
-          destination: backendLogFile,
-          mkdir: true,
-        },
-      },
-    ],
-  },
-})
+    })
+  }
+
+  // Production: synchronous multistream (no worker threads, bundle-friendly)
+  const fileDestination = pino.destination({ dest: backendLogFile, mkdir: true, sync: false })
+  return pino(
+    {
+      level,
+      base: undefined,
+      timestamp: pino.stdTimeFunctions.isoTime,
+    },
+    pino.multistream([
+      { level: level as pino.Level, stream: process.stdout },
+      { level: level as pino.Level, stream: fileDestination },
+    ]),
+  )
+}
+
+const logger = buildLogger()
 
 export function createLogger(component: string): pino.Logger {
   return logger.child({ component })
