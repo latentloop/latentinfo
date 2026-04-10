@@ -49,10 +49,8 @@ async function main() {
   })
 
   // Configure dialog auto-allow from settings
-  if (settings.remoteDebuggingAutoAllow) {
-    monitor.setDialogAutoAllow(true)
-    log.info("Dialog auto-allow enabled")
-  }
+  monitor.setDialogAutoAllow(!!settings.remoteDebuggingAutoAllow)
+  log.info(`Dialog auto-allow ${settings.remoteDebuggingAutoAllow ? "enabled" : "disabled"}`)
 
   // Initialize attach queue
   initAttachQueue(
@@ -89,6 +87,18 @@ async function main() {
     visualizers,
     browsers: settings.browsers,
     collectors,
+    onSettingsChanged: (prev, next) => {
+      // When auto-attach is enabled, immediately try attaching to frontmost Chrome
+      if (!prev.autoAttach && next.autoAttach) {
+        log.info("Auto-attach enabled via settings, triggering immediate attach")
+        requestAutoAttach("activate")
+      }
+      // Keep dialog auto-allow in sync with the setting
+      if (prev.remoteDebuggingAutoAllow !== next.remoteDebuggingAutoAllow) {
+        monitor.setDialogAutoAllow(!!next.remoteDebuggingAutoAllow)
+        log.info(`Dialog auto-allow ${next.remoteDebuggingAutoAllow ? "enabled" : "disabled"} via settings`)
+      }
+    },
   })
 
   process.on("SIGINT", async () => {

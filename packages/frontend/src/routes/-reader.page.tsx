@@ -6,6 +6,7 @@ import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
 import "temml/dist/Temml-Local.css"
+import temmlScriptUrl from "temml/dist/temml.min.js?url"
 
 // Load temml via dynamic script tag — Vite's dependency optimizer corrupts the ESM build,
 // causing \text to render as individual characters. The UMD build works correctly.
@@ -24,7 +25,7 @@ function getTemml(): any {
 if (typeof document !== "undefined" && !document.getElementById("temml-script")) {
   const s = document.createElement("script")
   s.id = "temml-script"
-  s.src = "/node_modules/temml/dist/temml.min.js"
+  s.src = temmlScriptUrl
   document.head.appendChild(s)
 }
 

@@ -6,6 +6,7 @@ tmp/
 
 # local packages
 packages/gui-test
+packages/gui-bun
 docs/
 
 # TypeScript build output (generated alongside source files)

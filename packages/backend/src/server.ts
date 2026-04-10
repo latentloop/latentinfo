@@ -72,6 +72,8 @@ export interface ServerConfig {
   visualizers: VisualizerDefinition[]
   browsers: BrowserEntry[]
   collectors: CollectorDefinition[]
+  /** Called after settings are saved via PUT /api/v1/settings. */
+  onSettingsChanged?: (prev: AppSettings, next: AppSettings) => void
 }
 
 export interface ServerHandle {
@@ -198,7 +200,7 @@ function killStaleProcess(port: number): void {
 }
 
 export async function startServer(config: ServerConfig): Promise<ServerHandle> {
-  const { appConfig, staticDir, db, visualizers, browsers, collectors } = config
+  const { appConfig, staticDir, db, visualizers, browsers, collectors, onSettingsChanged } = config
   const { host, port } = appConfig.server
 
   killStaleProcess(port)
@@ -325,6 +327,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
           const current = loadSettings()
           const merged = { ...current, ...update } as AppSettings
           saveSettings(merged)
+          onSettingsChanged?.(current, merged)
           sendJson(res, 200, merged)
         } catch (e: any) {
           sendJson(res, 400, { error: e.message || "Invalid request body" })

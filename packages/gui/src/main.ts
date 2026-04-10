@@ -228,8 +228,8 @@ function createMainWindow(): BrowserWindow {
     return { action: "deny" }
   })
 
-  // Load the frontend
-  // In test/production mode, load from the backend (static serving). In dev, use Vite.
+  // Load the frontend.
+  // In packaged or static-dir mode, load from the backend's static serving. In dev, use Vite.
   const useBackend = app.isPackaged || !!process.env.LATENT_INFO_STATIC_DIR
   const loadUrl = useBackend ? BACKEND_URL : VITE_DEV_URL
   console.log(`[gui] Loading: ${loadUrl}`)
@@ -240,8 +240,8 @@ function createMainWindow(): BrowserWindow {
     win.webContents.focus()
   })
 
-  // Open devtools in development (but not during tests)
-  if (!app.isPackaged && process.env.NODE_ENV !== "test") {
+  // Open devtools only for the real Vite-driven development flow.
+  if (!useBackend && process.env.NODE_ENV !== "test") {
     win.webContents.openDevTools({ mode: "detach" })
   }
 

@@ -272,6 +272,8 @@ interface RunnerState {
   conn: CdpConnection
   /** targetId -> set of collector IDs that have been injected */
   injectedTargets: Map<string, Set<string>>
+  /** targetId -> latest URL seen while the target was already being processed */
+  pendingTargetUrls: Map<string, string>
   cleanups: (() => void)[]
   active: boolean
   /** True once cdpHandlers have finished — page handlers must wait for this. */
@@ -285,6 +287,46 @@ const processingTargets = new Set<string>()
 
 const t0 = Date.now()
 function ts() { return `+${Date.now() - t0}ms` }
+
+type TargetInfoChangeDecision =
+  | "ignore"
+  | "clear"
+  | "check-now"
+  | "queue-check"
+  | "attach-now"
+  | "queue-attach"
+
+type PageReadinessSnapshot = {
+  hasBody: boolean
+  readyState: string
+  locationHref: string
+}
+
+function isPageReadyForCollectors(value: unknown): value is PageReadinessSnapshot {
+  if (!value || typeof value !== "object") return false
+  const snapshot = value as Record<string, unknown>
+  return snapshot.hasBody === true &&
+    typeof snapshot.readyState === "string" &&
+    snapshot.readyState !== "loading" &&
+    typeof snapshot.locationHref === "string" &&
+    snapshot.locationHref.startsWith("http")
+}
+
+function decideTargetInfoChange(
+  hasKnownTarget: boolean,
+  previousUrl: string | null,
+  nextUrl: string,
+  isProcessing: boolean,
+): TargetInfoChangeDecision {
+  if (hasKnownTarget) {
+    if (previousUrl === nextUrl) return "ignore"
+    if (!nextUrl.startsWith("http")) return "clear"
+    return isProcessing ? "queue-check" : "check-now"
+  }
+
+  if (!nextUrl.startsWith("http")) return "ignore"
+  return isProcessing ? "queue-attach" : "attach-now"
+}
 
 // ---------------------------------------------------------------------------
 // URL pattern matching
@@ -326,6 +368,7 @@ export async function startCollectorRunner(
     sessionName,
     conn: session.conn,
     injectedTargets: new Map(),
+    pendingTargetUrls: new Map(),
     cleanups: [],
     active: true,
     cdpReady: false,
@@ -355,27 +398,45 @@ export async function startCollectorRunner(
     if (info.type !== "page") return
 
     const target = session.targets.get(info.targetId)
-    if (target) {
-      if (processingTargets.has(info.targetId)) return
-      if (target.url !== info.url) {
+    const decision = decideTargetInfoChange(
+      Boolean(target),
+      target?.url ?? null,
+      info.url,
+      processingTargets.has(info.targetId),
+    )
+
+    if (target) target.url = info.url
+
+    switch (decision) {
+      case "ignore":
+        return
+      case "clear":
+        log.debug(`${ts()} EVENT targetInfoChanged (clear): ${info.url.slice(0, 60)}`)
+        state.injectedTargets.delete(info.targetId)
+        clearNotifyHandlers(info.targetId)
+        state.pendingTargetUrls.delete(info.targetId)
+        return
+      case "queue-check":
+      case "queue-attach":
+        log.debug(`${ts()} EVENT targetInfoChanged (queued): ${info.url.slice(0, 60)}`)
+        state.injectedTargets.delete(info.targetId)
+        clearNotifyHandlers(info.targetId)
+        state.pendingTargetUrls.set(info.targetId, info.url)
+        return
+      case "check-now":
         log.debug(`${ts()} EVENT targetInfoChanged: ${info.url.slice(0, 60)}`)
-        target.url = info.url
-        if (info.url.startsWith("http")) {
-          // URL changed — re-check which collectors match
-          state.injectedTargets.delete(info.targetId)
-          clearNotifyHandlers(target.targetId)
-          checkAndRunCollectors(state, target, collectors, db).catch((e) => {
-            if (!isStaleSessionError(e)) log.error(e, "checkAndRunCollectors error")
-          })
-        } else {
-          // Navigated away from http — clear everything
-          state.injectedTargets.delete(info.targetId)
-          clearNotifyHandlers(target.targetId)
-        }
-      }
-    } else if (info.url.startsWith("http")) {
-      log.debug(`${ts()} EVENT targetInfoChanged (new): ${info.url.slice(0, 60)}`)
-      handleNewTarget(state, info.targetId, info.url, collectors, db)
+        state.injectedTargets.delete(info.targetId)
+        clearNotifyHandlers(info.targetId)
+        checkAndRunCollectors(state, target!, collectors, db).catch((e) => {
+          if (!isStaleSessionError(e)) log.error(e, "checkAndRunCollectors error")
+        })
+        return
+      case "attach-now":
+        log.debug(`${ts()} EVENT targetInfoChanged (new): ${info.url.slice(0, 60)}`)
+        handleNewTarget(state, info.targetId, info.url, collectors, db).catch((e) => {
+          if (!isStaleSessionError(e)) log.error(e, "handleNewTarget error")
+        })
+        return
     }
   })
   state.cleanups.push(unsubChanged)
@@ -513,6 +574,7 @@ export function stopCollectorRunner(sessionName: string): void {
     }
   }
   state.injectedTargets.clear()
+  state.pendingTargetUrls.clear()
   runners.delete(sessionName)
   log.info(`Collector runner stopped for session: ${sessionName}`)
 }
@@ -542,18 +604,26 @@ async function handleNewTarget(
     log.debug(`${ts()} handleNewTarget: attaching ${url.slice(0, 60)}`)
     const target = await attachTarget(session, targetId, url)
     if (!target) return
-    log.debug(`${ts()} handleNewTarget: attached, waiting for body`)
+    log.debug(`${ts()} handleNewTarget: attached, waiting for page readiness`)
 
-    let bodyReady = false
+    let pageReady = false
     for (let i = 0; i < 10; i++) {
       try {
         const r = await sendCommand(state.conn, "Runtime.evaluate", {
-          expression: "!!document.body",
+          expression: `({
+            hasBody: !!document.body,
+            readyState: document.readyState,
+            locationHref: location.href
+          })`,
           returnByValue: true,
-        }, target.sessionId, 3000) as { result: { value: boolean } }
-        if (r.result.value) { bodyReady = true; break }
+        }, target.sessionId, 3000) as { result: { value: unknown } }
+        if (isPageReadyForCollectors(r.result.value)) {
+          pageReady = true
+          target.url = r.result.value.locationHref
+          break
+        }
       } catch { /* page not ready */ }
-      log.debug(`${ts()} handleNewTarget: body not ready, waiting (attempt ${i + 1})`)
+      log.debug(`${ts()} handleNewTarget: page not ready, waiting (attempt ${i + 1})`)
       await new Promise<void>((resolve) => {
         const unsub = onEvent(state.conn, "Page.lifecycleEvent", (_, sid) => {
           if (sid === target.sessionId) { unsub(); resolve() }
@@ -561,13 +631,39 @@ async function handleNewTarget(
         setTimeout(() => { unsub(); resolve() }, 500)
       })
     }
-    if (!bodyReady) { log.debug(`${ts()} handleNewTarget: body never ready, skipping`); return }
-    log.debug(`${ts()} handleNewTarget: body ready, running collectors`)
+    if (!pageReady) { log.debug(`${ts()} handleNewTarget: page never became ready, skipping`); return }
+    log.debug(`${ts()} handleNewTarget: page ready, running collectors`)
 
     await checkAndRunCollectors(state, target, collectors, db)
     log.debug(`${ts()} handleNewTarget: done`)
   } finally {
     processingTargets.delete(targetId)
+
+    const pendingUrl = state.pendingTargetUrls.get(targetId)
+    if (!pendingUrl || !state.active) return
+
+    state.pendingTargetUrls.delete(targetId)
+    const session = getSession(state.sessionName)
+    if (!session) return
+
+    const pendingTarget = session.targets.get(targetId)
+    if (pendingTarget) {
+      pendingTarget.url = pendingUrl
+      if (!pendingUrl.startsWith("http")) {
+        state.injectedTargets.delete(targetId)
+        clearNotifyHandlers(targetId)
+        return
+      }
+      checkAndRunCollectors(state, pendingTarget, collectors, db).catch((e) => {
+        if (!isStaleSessionError(e)) log.error(e, "checkAndRunCollectors error")
+      })
+      return
+    }
+
+    if (!pendingUrl.startsWith("http")) return
+    handleNewTarget(state, targetId, pendingUrl, collectors, db).catch((e) => {
+      if (!isStaleSessionError(e)) log.error(e, "handleNewTarget error")
+    })
   }
 }
 
@@ -705,4 +801,9 @@ export function getRunnerInfo(): { sessionName: string; pageCount: number }[] {
     sessionName: name,
     pageCount: state.injectedTargets.size,
   }))
+}
+
+export const __test__ = {
+  decideTargetInfoChange,
+  isPageReadyForCollectors,
 }

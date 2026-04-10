@@ -208,6 +208,7 @@ export function startBrowserMonitor(
 ): { stop: () => void; setDialogAutoAllow: (enabled: boolean) => void; triggerDialogBurst: () => void } {
   let child: ChildProcess | null = null
   let pollTimer: ReturnType<typeof setInterval> | null = null
+  let dialogAutoAllowEnabled = false
 
   // Browser names for dialog detection (e.g. "Google Chrome", "Google Chrome Canary")
   const browserProcessNames = browsers
@@ -502,11 +503,16 @@ RunLoop.main.run()
     },
     /** Enable/disable the dialog auto-dismiss in the Swift process. */
     setDialogAutoAllow(enabled: boolean) {
+      dialogAutoAllowEnabled = enabled
       sendToSwift(`DIALOG_AUTO_ALLOW:${enabled ? "on" : "off"}`)
       log.info({ enabled }, "Dialog auto-allow updated")
     },
     /** Start fast 200ms polling for ~10s (call before each attach attempt). */
     triggerDialogBurst() {
+      if (!dialogAutoAllowEnabled) {
+        log.debug("Skipping dialog burst: auto-allow disabled")
+        return
+      }
       log.debug("Dialog burst triggered")
       sendToSwift("DIALOG_CHECK_BURST")
     },
