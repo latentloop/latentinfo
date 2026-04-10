@@ -19,6 +19,7 @@
 /* eslint-disable @typescript-eslint/no-unsafe-function-type */
 
 import type { PageProxy } from "../../collector-runner.js"
+import { chooseDownNavigationTarget, chooseViewportFocusIndex } from "./action-navigation.js"
 
 // ---------------------------------------------------------------------------
 // Panel UI functions — serialized via installModule("x_action", { ... })
@@ -109,12 +110,22 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
   // 2. Inject skip handler + scroll logic + focus dot
   await page.evaluate(`(function() {
     var L = window.__llog;
+    var chooseDownNavigationTarget = ${chooseDownNavigationTarget.toString()};
+    var chooseViewportFocusIndex = ${chooseViewportFocusIndex.toString()};
     L("info", "installing skip handler...");
 
     // SPA cleanup: remove previous handler if re-injected (pushState navigation)
     if (window.__latentKeyHandler) {
       window.removeEventListener("keydown", window.__latentKeyHandler, true);
       L("debug", "removed old handler");
+    }
+    if (window.__latentScrollFocusHandler) {
+      window.removeEventListener("scroll", window.__latentScrollFocusHandler);
+      L("debug", "removed old scroll focus handler");
+    }
+    if (window.__latentUrlChangeHandler) {
+      window.removeEventListener("popstate", window.__latentUrlChangeHandler);
+      L("debug", "removed old URL change handler");
     }
 
     var FRESH_MS = ${Math.round((freshMinutes ?? 0.5) * 60000)};
@@ -155,8 +166,7 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
       return null;
     }
 
-    function isUnseen(art) {
-      var path = getTweetPathname(art);
+    function isUnseenPath(path) {
       if (!path) return false;  // no permalink = ad/promoted tweet, skip during navigation
       var ts = collectAt[path];
       if (!ts) return true;  // not collected yet → unseen, don't skip
@@ -233,42 +243,6 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
     }
 
     // --- Navigation primitives ---
-    function findNext(cursorEl) {
-      var arts = document.querySelectorAll('article[data-testid="tweet"]');
-      var threshold = Math.floor(window.innerHeight * 0.2) + 50;
-      var best = null, bestTop = Infinity;
-      var below = 0, seen = 0;
-      for (var i = 0; i < arts.length; i++) {
-        try {
-          if (cursorEl && arts[i] === cursorEl) continue;
-          var rect = arts[i].getBoundingClientRect();
-          if (rect.top <= threshold) continue;
-          below++;
-          if (!isUnseen(arts[i])) { seen++; continue; }
-          if (rect.top < bestTop) { bestTop = rect.top; best = arts[i]; }
-        } catch(e) {}
-      }
-      if (!best) L("debug", "findNext: arts=" + arts.length + " belowThreshold=" + below + " seen=" + seen + " threshold=" + threshold);
-      return best;
-    }
-
-    function findNearestUnseenInViewport() {
-      var arts = document.querySelectorAll('article[data-testid="tweet"]');
-      var anchor = window.innerHeight * 0.2;
-      var vh = window.innerHeight;
-      var best = null, bestDist = Infinity;
-      for (var i = 0; i < arts.length; i++) {
-        try {
-          var rect = arts[i].getBoundingClientRect();
-          if (rect.bottom < 0 || rect.top > vh) continue;
-          if (!isUnseen(arts[i])) continue;
-          var d = Math.abs(rect.top - anchor);
-          if (d < bestDist) { bestDist = d; best = arts[i]; }
-        } catch(e) {}
-      }
-      return best;
-    }
-
     function findPreviousTweetInDOM(cursorEl) {
       var arts = document.querySelectorAll('article[data-testid="tweet"]');
       if (!cursorEl) {
@@ -292,27 +266,46 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
       return null;
     }
 
-    function findNextTweetInDOM(cursorEl) {
+    function collectDownNavigationCandidates(cursorEl) {
       var arts = document.querySelectorAll('article[data-testid="tweet"]');
-      if (!cursorEl) {
-        // No cursor — pick the first tweet below viewport anchor
-        var anchor = window.innerHeight * 0.2;
-        var best = null, bestTop = Infinity;
-        for (var i = 0; i < arts.length; i++) {
-          try {
-            var rect = arts[i].getBoundingClientRect();
-            if (rect.top <= anchor) continue;
-            if (rect.top < bestTop) { bestTop = rect.top; best = arts[i]; }
-          } catch(e) {}
+      var candidates = [];
+      for (var i = 0; i < arts.length; i++) {
+        try {
+          var art = arts[i];
+          var rect = art.getBoundingClientRect();
+          var path = getTweetPathname(art);
+          candidates.push({
+            top: rect.top,
+            bottom: rect.bottom,
+            isCursor: !!cursorEl && art === cursorEl,
+            isValid: !!path,
+            isUnseen: isUnseenPath(path),
+            element: art
+          });
+        } catch(e) {}
+      }
+      return candidates;
+    }
+
+    function focusViewportTweet() {
+      var candidates = collectDownNavigationCandidates(navState.cursor ? navState.cursor.element : null);
+      var index = chooseViewportFocusIndex(candidates, {
+        viewportHeight: window.innerHeight
+      });
+      if (index === -1) return false;
+      var target = candidates[index] && candidates[index].element;
+      if (!target) return false;
+      setCursor(target);
+      return true;
+    }
+
+    function scrollViewportAndFocus() {
+      var el = document.scrollingElement || document.documentElement;
+      smoothScroll(el.scrollTop + window.innerHeight * 0.6, function() {
+        if (!focusViewportTweet()) {
+          L("debug", "scrollViewportAndFocus: no tweet visible after scroll");
         }
-        return best;
-      }
-      var found = false;
-      for (var j = 0; j < arts.length; j++) {
-        if (found) return arts[j];
-        if (arts[j] === cursorEl) found = true;
-      }
-      return null;
+      });
     }
 
     // --- Smooth scroll ---
@@ -386,31 +379,33 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
       if (cursorEl && !cursorEl.isConnected && navState.cursor) {
         cursorEl = resolveElement(navState.cursor);
       }
-      // Tier 1: unseen tweet below (freshness-filtered)
-      var next = findNext(cursorEl);
-      if (next) {
-        var nextRect = next.getBoundingClientRect();
-        if (nextRect.top > MAX_SKIP_DIST * window.innerHeight) {
-          L("debug", "findNext too far (" + Math.round(nextRect.top) + "px), trying viewport fallback");
-          var vp = findNearestUnseenInViewport();
-          if (vp) { next = vp; }
+      var candidates = collectDownNavigationCandidates(cursorEl);
+      var decision = chooseDownNavigationTarget(candidates, {
+        viewportHeight: window.innerHeight,
+        maxSkipDistanceMultiplier: MAX_SKIP_DIST
+      });
+      if (decision.action === "focus-target") {
+        var target = candidates[decision.index] && candidates[decision.index].element;
+        if (target) {
+          setCursor(target);
+          animateTo(target, null);
+          return true;
         }
-        setCursor(next);
-        animateTo(next, null);
-        return true;
       }
-      // Tier 2: next tweet in DOM order (regardless of seen status)
-      var domNext = findNextTweetInDOM(cursorEl);
-      if (domNext) {
-        L("debug", "no unseen forward, falling back to DOM-order next");
-        setCursor(domNext);
-        animateTo(domNext, null);
-        return true;
+      if (decision.action === "focus-viewport") {
+        var viewportTarget = candidates[decision.index] && candidates[decision.index].element;
+        if (viewportTarget) {
+          L("debug", "cursor is outside the viewport, re-focusing a visible tweet");
+          setCursor(viewportTarget);
+          return true;
+        }
       }
-      // Tier 3: page scroll as last resort
-      var el = document.scrollingElement || document.documentElement;
-      L("info", "no tweets forward, scrolling page");
-      smoothScroll(el.scrollTop + window.innerHeight * 0.6, null);
+      if (decision.reason === "next-unseen-too-far") {
+        L("debug", "next unseen valid tweet is too far away, scrolling viewport instead");
+      } else {
+        L("debug", "no nearby unseen valid tweet, scrolling viewport instead");
+      }
+      scrollViewportAndFocus();
       return true;
     }
 
@@ -481,11 +476,12 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
         resetNavState();
       }
     };
+    window.__latentScrollFocusHandler = __scrollFocusFn;
     var __tracker = window.__latent && window.__latent.__tracker;
     if (__tracker) {
-      __tracker.addListener("x", window, "scroll", __scrollFocusFn, { passive: true });
+      __tracker.addListener("x", window, "scroll", window.__latentScrollFocusHandler, { passive: true });
     } else {
-      window.addEventListener("scroll", __scrollFocusFn, { passive: true });
+      window.addEventListener("scroll", window.__latentScrollFocusHandler, { passive: true });
     }
 
     // --- URL change detection ---
@@ -496,13 +492,17 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
         L("debug", "URL changed, navState reset");
       }
     }
-    window.addEventListener("popstate", onUrlMaybeChanged);
+    window.__latentUrlChangeHandler = onUrlMaybeChanged;
+    window.__latentOnUrlMaybeChanged = onUrlMaybeChanged;
+    window.addEventListener("popstate", window.__latentUrlChangeHandler);
     try {
       if (!history.pushState.__latentPatched) {
         var origPush = history.pushState;
         history.pushState = function() {
           var ret = origPush.apply(this, arguments);
-          setTimeout(onUrlMaybeChanged, 0);
+          setTimeout(function() {
+            if (window.__latentOnUrlMaybeChanged) window.__latentOnUrlMaybeChanged();
+          }, 0);
           return ret;
         };
         history.pushState.__latentPatched = true;
@@ -511,7 +511,9 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
         var origReplace = history.replaceState;
         history.replaceState = function() {
           var ret = origReplace.apply(this, arguments);
-          setTimeout(onUrlMaybeChanged, 0);
+          setTimeout(function() {
+            if (window.__latentOnUrlMaybeChanged) window.__latentOnUrlMaybeChanged();
+          }, 0);
           return ret;
         };
         history.replaceState.__latentPatched = true;
