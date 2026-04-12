@@ -62,6 +62,9 @@ const HEALTH_TIMEOUT_MS = 10_000
 // ---------------------------------------------------------------------------
 
 let mainWindow: BrowserWindow | null = null
+
+/** Whether the macOS dock API is available. */
+const hasDock = process.platform === "darwin"
 let tray: Tray | null = null
 let backendProcess: ChildProcess | null = null
 let isQuitting = false
@@ -212,11 +215,19 @@ function createMainWindow(): BrowserWindow {
     win.show()
   })
 
-  // Hide on close instead of destroying (tray keeps running)
+  // Hide on close instead of destroying (tray keeps running).
+  // Show the tray notification first (if not yet dismissed), then hide.
   win.on("close", (event) => {
     if (!isQuitting) {
       event.preventDefault()
-      showTrayNotificationOnce(win).then(() => win.hide())
+      showTrayNotificationOnce(win)
+        .catch((err) => console.error("[gui] Tray notification error:", err))
+        .finally(() => {
+          win.hide()
+          if (hasDock && app.dock) {
+            app.dock.hide()
+          }
+        })
     }
   })
 
@@ -285,8 +296,15 @@ function createTray(): Tray {
   return systemTray
 }
 
-function showMainWindow(): void {
+export async function showMainWindow(): Promise<void> {
   if (mainWindow) {
+    if (hasDock && app.dock) {
+      try {
+        await app.dock.show()
+      } catch (err) {
+        console.error("[gui] Failed to show dock icon:", err)
+      }
+    }
     mainWindow.show()
     mainWindow.focus()
     if (mainWindow.isMinimized()) {
@@ -470,7 +488,7 @@ async function showTrayNotificationOnce(win: BrowserWindow): Promise<void> {
   const settings = await readSettings()
   if (settings.hideToTrayNotified) return
 
-  const { response, checkboxChecked } = await dialog.showMessageBox(win, {
+  const { checkboxChecked } = await dialog.showMessageBox(win, {
     type: "info",
     title: "LatentInfo",
     message: "LatentInfo will be minimized",
@@ -523,7 +541,7 @@ async function bootstrap(): Promise<void> {
   await app.whenReady()
 
   // Set dock icon on macOS
-  if (process.platform === "darwin" && app.dock) {
+  if (hasDock && app.dock) {
     const dockIcon = nativeImage.createFromPath(join(__dirname, "..", "icons", "app-icon-512.png"))
     app.dock.setIcon(dockIcon)
   }
