@@ -18,6 +18,7 @@ export interface CollectorSettings {
   freshMinutes?: number
   freshUnit?: "sec" | "min"
   auto_detect?: Record<string, boolean>
+  logLevel?: "trace" | "debug" | "info" | "warn" | "error" | "fatal"
 }
 
 export function getCollectorsDir(): string {

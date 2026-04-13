@@ -328,6 +328,7 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
           const merged = { ...current, ...update } as AppSettings
           saveSettings(merged)
           onSettingsChanged?.(current, merged)
+          broadcastSseEvent("settings-changed", {})
           sendJson(res, 200, merged)
         } catch (e: any) {
           sendJson(res, 400, { error: e.message || "Invalid request body" })
@@ -690,6 +691,55 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
           config: loadCollectorConfig(c.id),
         })),
       })
+      return
+    }
+
+    // Per-collector config update — eliminates read-modify-write race through AppSettings
+    const collectorConfigMatch = pathname.match(/^\/api\/v1\/collectors\/([^/]+)\/config$/)
+    if (collectorConfigMatch && method === "PUT") {
+      const collectorId = collectorConfigMatch[1]!
+      const known = collectors.find((c) => c.id === collectorId)
+      if (!known) {
+        sendJson(res, 404, { error: `Collector '${collectorId}' not found` })
+        return
+      }
+      try {
+        const body = await readBody(req)
+        const update = JSON.parse(body) as Record<string, unknown>
+        // Validate known CollectorSettings fields
+        if (update.enabled !== undefined && typeof update.enabled !== "boolean") {
+          sendJson(res, 400, { error: "enabled must be a boolean" })
+          return
+        }
+        if (update.freshMinutes !== undefined && typeof update.freshMinutes !== "number") {
+          sendJson(res, 400, { error: "freshMinutes must be a number" })
+          return
+        }
+        if (update.freshUnit !== undefined && update.freshUnit !== "sec" && update.freshUnit !== "min") {
+          sendJson(res, 400, { error: "freshUnit must be 'sec' or 'min'" })
+          return
+        }
+        if (update.auto_detect !== undefined && (typeof update.auto_detect !== "object" || Array.isArray(update.auto_detect))) {
+          sendJson(res, 400, { error: "auto_detect must be an object" })
+          return
+        }
+        const validLogLevels = new Set(["trace", "debug", "info", "warn", "error", "fatal"])
+        if (update.logLevel !== undefined && (typeof update.logLevel !== "string" || !validLogLevels.has(update.logLevel as string))) {
+          sendJson(res, 400, { error: "logLevel must be one of: trace, debug, info, warn, error, fatal" })
+          return
+        }
+        const allowedKeys = new Set(["enabled", "freshMinutes", "freshUnit", "auto_detect", "logLevel"])
+        const unknownKeys = Object.keys(update).filter((k) => !allowedKeys.has(k))
+        if (unknownKeys.length > 0) {
+          sendJson(res, 400, { error: `Unknown config keys: ${unknownKeys.join(", ")}` })
+          return
+        }
+        const config = update as CollectorSettings
+        saveCollectorConfig(collectorId, config)
+        sendJson(res, 200, config)
+      } catch (e: any) {
+        sendJson(res, 400, { error: e.message || "Invalid request body" })
+      }
       return
     }
 

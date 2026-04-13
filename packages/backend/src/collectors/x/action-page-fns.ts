@@ -96,14 +96,17 @@ export function __xActionInitPanel(opts) {
  * Called by the X collector's actionHandler entry point.
  */
 export async function injectActionLogic(page: PageProxy, logLevel: string, freshMinutes?: number): Promise<void> {
-  // 1. Inject log helper
+  // 1. Inject log helper (logs to both browser console and backend via __latentNotify)
   await page.evaluate(`(function() {
     var LEVELS = { trace: 0, debug: 1, info: 2, warn: 3, error: 4, fatal: 5 };
     window.__latentLogLevel = ${JSON.stringify(logLevel)};
     window.__llog = function(level, msg) {
       var threshold = window.__latentLogLevel in LEVELS ? LEVELS[window.__latentLogLevel] : 3;
       var num = level in LEVELS ? LEVELS[level] : 2;
-      if (num >= threshold) console.log("[latent] " + msg);
+      if (num >= threshold) {
+        console.log("[latent] " + msg);
+        try { if (window.__latentInfoNotify) window.__latentInfoNotify("log:" + level + ":" + msg); } catch(e) {}
+      }
     };
   })()`)
 
@@ -143,7 +146,7 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
     var MAX_HISTORY = 50;
     var MAX_PENDING = 10;
     var STALE_CONTEXT_MULT = 3;   // viewport heights
-    var MAX_SKIP_DIST = 2;        // viewport heights, for Down too-far fallback
+    var SCROLL_SKIP_MULT = 3;     // viewport heights: skip-focus ceiling & scroll distance
     var lastUrl = location.href;
 
     // --- Utilities ---
@@ -166,10 +169,18 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
       return null;
     }
 
-    function isUnseenPath(path) {
+    function isUnseenPath(path, article) {
       if (!path) return false;  // no permalink = ad/promoted tweet, skip during navigation
       var ts = collectAt[path];
-      if (!ts) return true;  // not collected yet → unseen, don't skip
+      if (!ts) {
+        // Map miss — check DOM for a badge (handles race where initial scrape
+        // ran before the addBadges patch was installed).
+        if (article && article.querySelector(".li-scrape-badge")) {
+          L("trace", "isUnseen " + path + " map-miss but badge present => false");
+          return false;
+        }
+        return true;  // not collected yet → unseen, don't skip
+      }
       var age = Date.now() - ts;
       var unseen = age < FRESH_MS;
       L("trace", "isUnseen " + path + " age=" + Math.round(age / 1000) + "s fresh=" + Math.round(FRESH_MS / 1000) + "s => " + unseen);
@@ -279,7 +290,7 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
             bottom: rect.bottom,
             isCursor: !!cursorEl && art === cursorEl,
             isValid: !!path,
-            isUnseen: isUnseenPath(path),
+            isUnseen: isUnseenPath(path, art),
             element: art
           });
         } catch(e) {}
@@ -301,7 +312,7 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
 
     function scrollViewportAndFocus() {
       var el = document.scrollingElement || document.documentElement;
-      smoothScroll(el.scrollTop + window.innerHeight * 0.6, function() {
+      smoothScroll(el.scrollTop + window.innerHeight * SCROLL_SKIP_MULT, function() {
         if (!focusViewportTweet()) {
           L("debug", "scrollViewportAndFocus: no tweet visible after scroll");
         }
@@ -352,7 +363,7 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
       var rect = element.getBoundingClientRect();
       var offset = Math.floor(window.innerHeight * 0.2);
       var targetY = Math.max(0, el.scrollTop + rect.top - offset);
-      L("debug", "animateTo rect.top=" + Math.round(rect.top) + " targetY=" + Math.round(targetY));
+      L("trace", "animateTo rect.top=" + Math.round(rect.top) + " targetY=" + Math.round(targetY));
       smoothScroll(targetY, onArrive);
     }
 
@@ -374,38 +385,62 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
     }
 
     // --- Navigation commands ---
+    function describeCursor() {
+      if (!navState.cursor) return "none";
+      var p = navState.cursor.pathname || "?";
+      var el = navState.cursor.element;
+      var badge = el ? !!el.querySelector(".li-scrape-badge") : false;
+      var ts = collectAt[p];
+      return p + " badge=" + badge + " collectedAt=" + (ts ? new Date(ts).toISOString() : "none");
+    }
+
+    function describeCandidates(candidates) {
+      var parts = [];
+      for (var i = 0; i < candidates.length; i++) {
+        var c = candidates[i];
+        var path = "?";
+        try { path = getTweetPathname(c.element) || "no-path"; } catch(e) {}
+        parts.push("#" + i + " " + path + " top=" + Math.round(c.top) + " cur=" + c.isCursor + " unseen=" + c.isUnseen);
+      }
+      return parts.join(" | ");
+    }
+
     function executeDown() {
+      L("trace", "▼ DOWN before=" + describeCursor());
+
       var cursorEl = navState.cursor ? navState.cursor.element : null;
       if (cursorEl && !cursorEl.isConnected && navState.cursor) {
         cursorEl = resolveElement(navState.cursor);
+        L("trace", "▼ DOWN resolved disconnected cursor → " + (cursorEl ? "found" : "null"));
       }
       var candidates = collectDownNavigationCandidates(cursorEl);
+      L("trace", "▼ DOWN candidates(" + candidates.length + "): " + describeCandidates(candidates));
+
       var decision = chooseDownNavigationTarget(candidates, {
         viewportHeight: window.innerHeight,
-        maxSkipDistanceMultiplier: MAX_SKIP_DIST
+        maxSkipDistanceMultiplier: SCROLL_SKIP_MULT
       });
-      if (decision.action === "focus-target") {
-        var target = candidates[decision.index] && candidates[decision.index].element;
-        if (target) {
-          setCursor(target);
-          animateTo(target, null);
+      L("trace", "▼ DOWN decision=" + decision.action + " reason=" + (decision.reason || "n/a") + " index=" + (decision.index !== undefined ? decision.index : "n/a"));
+
+      if (decision.action === "focus-target" || decision.action === "focus-viewport") {
+        var el = candidates[decision.index] && candidates[decision.index].element;
+        if (el) {
+          if (decision.action === "focus-viewport") {
+            L("trace", "cursor is outside the viewport, re-focusing a visible tweet");
+            setCursor(el);
+          } else {
+            setCursor(el);
+            animateTo(el, null);
+          }
+          L("trace", "▼ DOWN after=" + describeCursor());
           return true;
         }
       }
-      if (decision.action === "focus-viewport") {
-        var viewportTarget = candidates[decision.index] && candidates[decision.index].element;
-        if (viewportTarget) {
-          L("debug", "cursor is outside the viewport, re-focusing a visible tweet");
-          setCursor(viewportTarget);
-          return true;
-        }
-      }
-      if (decision.reason === "next-unseen-too-far") {
-        L("debug", "next unseen valid tweet is too far away, scrolling viewport instead");
-      } else {
-        L("debug", "no nearby unseen valid tweet, scrolling viewport instead");
-      }
+      L("trace", decision.reason === "next-unseen-too-far"
+        ? "next unseen valid tweet is too far away, scrolling " + SCROLL_SKIP_MULT + "vh"
+        : "no nearby unseen valid tweet, scrolling " + SCROLL_SKIP_MULT + "vh");
       scrollViewportAndFocus();
+      L("trace", "▼ DOWN after=" + describeCursor());
       return true;
     }
 
@@ -551,6 +586,10 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
         btn.innerHTML = '<span style="font-size:14px">' + icon + '</span><span style="font-size:11px">skip (' + window.__latentFreshLabel + ')</span>';
       }
     };
+    window.__latentSetLogLevel = function(level) {
+      window.__latentLogLevel = level;
+      L("debug", "logLevel set to " + level);
+    };
 
     // --- Keyboard handler with coalesce ---
     window.__latentKeyHandler = function(e) {
@@ -607,7 +646,7 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
             map[p] = new Date(items[i].collectAt).getTime();
           }
         }
-        L("debug", "addBadges: updated " + items.length + " entries, map size=" + Object.keys(map).length);
+        L("trace", "addBadges: updated " + items.length + " entries, map size=" + Object.keys(map).length);
       };
       window.__latent.li_x.addBadges.__ts_patched = true;
     }

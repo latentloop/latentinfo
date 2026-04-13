@@ -119,7 +119,7 @@ export async function requestManualAttach(sessionName: string, wsUrl: string): P
   log.info({ sessionName }, "Manual attach requested")
   _triggerDialogBurst?.()
   _lastAttachStartMs = Date.now()
-  const ok = await attach(sessionName, wsUrl)
+  const ok = await attach(sessionName, wsUrl, 5000, () => _onSessionChange?.("session-disconnected", sessionName))
   const attachMs = Date.now() - _lastAttachStartMs
   if (ok) {
     _onSessionChange?.("session-attached", sessionName)
@@ -218,7 +218,8 @@ async function processQueue(targetSessions?: ReadonlySet<string>): Promise<void>
       _lastAttachStartMs = Date.now()
 
       try {
-        let ok = await attach(sn, wsUrl)
+        const onDisconnect = () => _onSessionChange?.("session-disconnected", sn)
+        let ok = await attach(sn, wsUrl, 5000, onDisconnect)
 
         // First attempt likely fails with 403 (dialog just appeared).
         // Wait for Swift to dismiss it (burst polling at 100ms), then retry.
@@ -226,7 +227,7 @@ async function processQueue(targetSessions?: ReadonlySet<string>): Promise<void>
           log.debug({ sn }, "Auto-attach retry — waiting for dialog dismissal")
           _triggerDialogBurst?.()
           await new Promise((r) => setTimeout(r, 2000))
-          ok = await attach(sn, wsUrl)
+          ok = await attach(sn, wsUrl, 5000, onDisconnect)
         }
 
         const attachMs = Date.now() - _lastAttachStartMs

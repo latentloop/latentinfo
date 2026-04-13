@@ -46,6 +46,12 @@ async function main() {
   // dialog_dismissed is mapped to "activate" so auto-attach retries after the dialog is gone.
   const monitor = startBrowserMonitor(settings.browsers, (event) => {
     requestAutoAttach(event === "dialog_dismissed" ? "activate" : event)
+    // Push session list changes immediately to dashboard clients so the
+    // overview page reflects a closed or newly launched browser without
+    // waiting for a successful auto-attach.
+    if (event === "launch" || event === "terminate") {
+      broadcastSseEvent("session-changed", { event })
+    }
   })
 
   // Configure dialog auto-allow from settings
@@ -93,9 +99,9 @@ async function main() {
         log.info("Auto-attach enabled via settings, triggering immediate attach")
         requestAutoAttach("activate")
       }
-      // Keep dialog auto-allow in sync with the setting
+      // Always sync dialog auto-allow — ensures in-memory Swift state matches the persisted setting
+      monitor.setDialogAutoAllow(!!next.remoteDebuggingAutoAllow)
       if (prev.remoteDebuggingAutoAllow !== next.remoteDebuggingAutoAllow) {
-        monitor.setDialogAutoAllow(!!next.remoteDebuggingAutoAllow)
         log.info(`Dialog auto-allow ${next.remoteDebuggingAutoAllow ? "enabled" : "disabled"} via settings`)
       }
     },

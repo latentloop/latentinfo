@@ -37,15 +37,30 @@ export function chooseViewportFocusIndex(
   const anchorRatio = options.anchorRatio ?? 0.2
   const anchor = viewportHeight * anchorRatio
 
+  // Prefer unseen+valid tweets; fall back to any visible tweet if none qualify
   let bestIndex = -1
   let bestDistance = Number.POSITIVE_INFINITY
   let bestTop = Number.POSITIVE_INFINITY
+  let fallbackIndex = -1
+  let fallbackDistance = Number.POSITIVE_INFINITY
+  let fallbackTop = Number.POSITIVE_INFINITY
 
   for (let i = 0; i < candidates.length; i++) {
     const candidate = candidates[i]!
     if (candidate.bottom < 0 || candidate.top > viewportHeight) continue
 
     const distanceFromAnchor = Math.abs(candidate.top - anchor)
+    const isBetter = distanceFromAnchor < fallbackDistance
+      || (distanceFromAnchor === fallbackDistance && candidate.top < fallbackTop)
+
+    if (isBetter) {
+      fallbackIndex = i
+      fallbackDistance = distanceFromAnchor
+      fallbackTop = candidate.top
+    }
+
+    if (!candidate.isValid || !candidate.isUnseen) continue
+
     if (
       distanceFromAnchor < bestDistance
       || (distanceFromAnchor === bestDistance && candidate.top < bestTop)
@@ -56,7 +71,7 @@ export function chooseViewportFocusIndex(
     }
   }
 
-  return bestIndex
+  return bestIndex !== -1 ? bestIndex : fallbackIndex
 }
 
 export function chooseDownNavigationTarget(

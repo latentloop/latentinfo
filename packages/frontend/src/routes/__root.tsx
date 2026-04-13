@@ -1,5 +1,7 @@
 import { createRootRoute, Link, Outlet, useMatches, useNavigate } from "@tanstack/react-router";
+import { QueryClientProvider } from "@tanstack/react-query";
 import React, { useState, useCallback, useEffect, useRef, Suspense, Activity } from "react";
+import { queryClient } from "@/lib/query-client";
 import { Icon } from "@iconify/react";
 import { cn } from "@/lib/utils";
 import { TabContext, type AppTab } from "@/lib/tab-context";
@@ -84,7 +86,7 @@ function RootLayout() {
     setActiveTabId((prev) => prev === id ? null : prev);
   }, [setActiveTabId]);
 
-  // Shared SSE connection — distributes events to child routes via window events
+  // Shared SSE connection — UI events via window, data events via QueryClient invalidation
   useEffect(() => {
     const es = new EventSource("/api/v1/events");
     es.addEventListener("open-app", (e) => {
@@ -105,12 +107,19 @@ function RootLayout() {
     es.addEventListener("data-changed", (e) => {
       window.dispatchEvent(new CustomEvent("sse:data-changed", { detail: e.data }));
     });
-    es.addEventListener("jobs-updated", (e) => {
-      window.dispatchEvent(new CustomEvent("sse:jobs-updated", { detail: e.data }));
+    es.addEventListener("jobs-updated", () => {
+      queryClient.invalidateQueries({ queryKey: ["jobs"] });
     });
-    es.addEventListener("session-changed", (e) => {
-      window.dispatchEvent(new CustomEvent("sse:session-changed", { detail: e.data }));
+    es.addEventListener("session-changed", () => {
+      queryClient.invalidateQueries({ queryKey: ["sessions"] });
     });
+    es.addEventListener("settings-changed", () => {
+      queryClient.invalidateQueries({ queryKey: ["settings"] });
+    });
+    es.onerror = () => {
+      // Reconnect gap — re-fetch all active queries to recover any missed updates
+      queryClient.invalidateQueries({ refetchType: "active" });
+    };
     return () => es.close();
   }, [openTab]);
 
@@ -280,6 +289,7 @@ function RootLayout() {
   const tabInactive = "text-muted-foreground border-transparent hover:text-foreground hover:bg-muted/50";
 
   return (
+    <QueryClientProvider client={queryClient}>
     <TabContext.Provider value={{ openTab }}>
       <Toaster />
       <div className="flex flex-col h-screen">
@@ -391,6 +401,7 @@ function RootLayout() {
         </div>
       </div>
     </TabContext.Provider>
+    </QueryClientProvider>
   );
 }
 

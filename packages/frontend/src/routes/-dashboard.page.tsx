@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -76,6 +77,7 @@ interface CollectorConfig {
   freshMinutes?: number;
   freshUnit?: "sec" | "min";
   auto_detect?: Record<string, boolean>;
+  logLevel?: "trace" | "debug" | "info" | "warn" | "error" | "fatal";
 }
 
 interface CollectorInfo {
@@ -122,17 +124,6 @@ interface JobInfo {
 
 const LOG_LEVELS = ["trace", "debug", "info", "warn", "error", "fatal"] as const;
 
-// Module-level caches so data survives unmount/remount on route switch
-const _overviewCache: {
-  status: StatusResponse | null;
-  sessions: BrowserSession[];
-  collectors: CollectorInfo[];
-  jobs: JobInfo[];
-  browsers: { name: string }[];
-} = { status: null, sessions: [], collectors: [], jobs: [], browsers: [] };
-
-const _settingsCache: { settings: AppSettings | null } = { settings: null };
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -172,40 +163,49 @@ function formatTime(iso: string | null): string {
 // ---------------------------------------------------------------------------
 
 function OverviewView() {
-  const [status, setStatus] = useState<StatusResponse | null>(_overviewCache.status);
-  const [sessions, setSessions] = useState<BrowserSession[]>(_overviewCache.sessions);
+  const queryClient = useQueryClient();
+  const [status, setStatus] = useState<StatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [collectors, setCollectors] = useState<CollectorInfo[]>(_overviewCache.collectors);
-  const [jobs, setJobs] = useState<JobInfo[]>(_overviewCache.jobs);
-  const [browsers, setBrowsers] = useState<{ name: string }[]>(_overviewCache.browsers);
-  const [selectedBrowser, setSelectedBrowser] = useState(() => _overviewCache.browsers[0]?.name ?? "");
   const [launching, setLaunching] = useState(false);
   const [attachErrors, setAttachErrors] = useState<Record<string, string>>({});
-  const refreshSessions = useCallback(() => {
-    fetch("/api/v1/sessions")
-      .then((r) => {
-        if (!r.ok) throw new Error(`Sessions API returned ${r.status}`);
-        return r.json();
-      })
-      .then((data: { sessions: BrowserSession[] }) => {
-        setSessions(data.sessions);
-        _overviewCache.sessions = data.sessions;
-      })
-      .catch(() => {});
-  }, []);
 
-  const refreshJobs = useCallback(() => {
-    fetch("/api/v1/jobs")
-      .then((r) => {
-        if (!r.ok) throw new Error(`Jobs API returned ${r.status}`);
-        return r.json();
-      })
-      .then((data: { jobs: JobInfo[] }) => {
-        setJobs(data.jobs);
-        _overviewCache.jobs = data.jobs;
-      })
-      .catch(() => {});
-  }, []);
+  const { data: sessionsData } = useQuery({
+    queryKey: ["sessions"],
+    queryFn: (): Promise<{ sessions: BrowserSession[] }> =>
+      fetch("/api/v1/sessions").then((r) => r.json()),
+    staleTime: 5_000,
+  });
+  const sessions = sessionsData?.sessions ?? [];
+
+  const { data: collectorsData } = useQuery({
+    queryKey: ["collectors"],
+    queryFn: (): Promise<{ collectors: CollectorInfo[] }> =>
+      fetch("/api/v1/collectors").then((r) => r.json()),
+    staleTime: 30_000,
+  });
+  const collectors = collectorsData?.collectors ?? [];
+
+  const { data: jobsData } = useQuery({
+    queryKey: ["jobs"],
+    queryFn: (): Promise<{ jobs: JobInfo[] }> =>
+      fetch("/api/v1/jobs").then((r) => r.json()),
+    staleTime: 10_000,
+  });
+  const jobs = jobsData?.jobs ?? [];
+
+  const { data: settingsData } = useQuery({
+    queryKey: ["settings"],
+    queryFn: (): Promise<AppSettings> =>
+      fetch("/api/v1/settings").then((r) => r.json()),
+    staleTime: 30_000,
+  });
+  const browsers = settingsData?.browsers ?? [];
+  const [selectedBrowser, setSelectedBrowser] = useState("");
+  useEffect(() => {
+    if (browsers.length > 0 && !selectedBrowser) {
+      setSelectedBrowser(browsers[0]!.name);
+    }
+  }, [browsers, selectedBrowser]);
 
   useEffect(() => {
     fetch("/api/v1/status")
@@ -213,35 +213,9 @@ function OverviewView() {
         if (!r.ok) throw new Error(`Status API returned ${r.status}`);
         return r.json();
       })
-      .then((data: StatusResponse) => { setStatus(data); _overviewCache.status = data; })
+      .then((data: StatusResponse) => setStatus(data))
       .catch((e) => setError(e.message ?? "Failed to load status"));
-
-    fetch("/api/v1/collectors")
-      .then((r) => {
-        if (!r.ok) throw new Error(`Collectors API returned ${r.status}`);
-        return r.json();
-      })
-      .then((data: { collectors: CollectorInfo[] }) => { setCollectors(data.collectors); _overviewCache.collectors = data.collectors; })
-      .catch(() => {});
-
-    fetch("/api/v1/settings")
-      .then((r) => r.json())
-      .then((data: { browsers?: { name: string }[] }) => {
-        const b = data.browsers ?? [];
-        setBrowsers(b);
-        _overviewCache.browsers = b;
-        if (b.length > 0) setSelectedBrowser(b[0]!.name);
-      })
-      .catch(() => {});
-
-    refreshSessions();
-    refreshJobs();
-    const onSessionChanged = () => refreshSessions();
-    const onJobsUpdated = () => refreshJobs();
-    window.addEventListener("sse:session-changed", onSessionChanged);
-    window.addEventListener("sse:jobs-updated", onJobsUpdated);
-    return () => { window.removeEventListener("sse:session-changed", onSessionChanged); window.removeEventListener("sse:jobs-updated", onJobsUpdated); };
-  }, [refreshSessions, refreshJobs]);
+  }, []);
 
   const handleLaunch = useCallback(() => {
     if (!selectedBrowser || launching) return;
@@ -253,12 +227,12 @@ function OverviewView() {
     })
       .then(() => {
         setTimeout(() => {
-          refreshSessions();
+          queryClient.invalidateQueries({ queryKey: ["sessions"] });
           setLaunching(false);
         }, 2000);
       })
       .catch(() => setLaunching(false));
-  }, [selectedBrowser, launching, refreshSessions]);
+  }, [selectedBrowser, launching, queryClient]);
 
   const handleAttach = useCallback(
     (session: BrowserSession) => {
@@ -279,13 +253,13 @@ function OverviewView() {
             const data = await r.json().catch(() => ({ error: fallback }));
             setAttachErrors((prev) => ({ ...prev, [session.sessionName]: data.error ?? fallback }));
           }
-          refreshSessions();
+          queryClient.invalidateQueries({ queryKey: ["sessions"] });
         })
         .catch(() => {
           setAttachErrors((prev) => ({ ...prev, [session.sessionName]: "Could not reach the backend — check that it is running and try again." }));
         });
     },
-    [refreshSessions],
+    [queryClient],
   );
 
   const handleDetach = useCallback(
@@ -295,37 +269,40 @@ function OverviewView() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionName: session.sessionName }),
       })
-        .then(() => refreshSessions())
+        .then(() => queryClient.invalidateQueries({ queryKey: ["sessions"] }))
         .catch(() => {});
     },
-    [refreshSessions],
+    [queryClient],
   );
+
+  const collectorConfigMutation = useMutation({
+    mutationFn: ({ collectorId, config }: { collectorId: string; config: CollectorConfig }) =>
+      fetch(`/api/v1/collectors/${encodeURIComponent(collectorId)}/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(config),
+      }).then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); }),
+    onMutate: async ({ collectorId, config }) => {
+      await queryClient.cancelQueries({ queryKey: ["collectors"] });
+      const snapshot = queryClient.getQueryData<{ collectors: CollectorInfo[] }>(["collectors"]);
+      queryClient.setQueryData<{ collectors: CollectorInfo[] }>(["collectors"], (old) =>
+        old ? { collectors: old.collectors.map((c) => c.id === collectorId ? { ...c, config } : c) } : old,
+      );
+      return { snapshot };
+    },
+    onError: (_err, _vars, context) => {
+      queryClient.setQueryData(["collectors"], context?.snapshot);
+      toast.error("Failed to save settings");
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["collectors"] }),
+    onSuccess: () => toast.success("Settings saved"),
+  });
 
   const handleCollectorConfigChange = useCallback(
     (collectorId: string, config: CollectorConfig) => {
-      // Optimistic update
-      setCollectors((prev) => {
-        const updated = prev.map((c) =>
-          c.id === collectorId ? { ...c, config } : c,
-        );
-        _overviewCache.collectors = updated;
-        return updated;
-      });
-      // Persist via settings
-      fetch("/api/v1/settings")
-        .then((r) => r.json())
-        .then((current: { collectors?: Record<string, CollectorConfig> }) => {
-          const merged = { collectors: { ...current.collectors, [collectorId]: config } };
-          return fetch("/api/v1/settings", {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(merged),
-          });
-        })
-        .then(() => { toast.success("Settings saved") })
-        .catch(() => { toast.error("Failed to save settings") });
+      collectorConfigMutation.mutate({ collectorId, config });
     },
-    [],
+    [collectorConfigMutation],
   );
 
   if (error) {
@@ -530,7 +507,7 @@ function OverviewView() {
               </TableRow>
             ) : (
               jobs.map((job) => (
-                <JobRow key={job.id} job={job} onRunComplete={refreshJobs} cdpConnected={sessions.some((s) => s.attached)} />
+                <JobRow key={job.id} job={job} onRunComplete={() => queryClient.invalidateQueries({ queryKey: ["jobs"] })} cdpConnected={sessions.some((s) => s.attached)} />
               ))
             )}
           </TableBody>
@@ -679,6 +656,28 @@ function CollectorRow({ collector: c, onConfigChange }: {
             </div>
           </div>
         ) : null}
+        {c.id === "x" && (
+          <div className="inline-flex items-center gap-2 text-xs text-muted-foreground mt-1">
+            <span className="whitespace-nowrap">Page log level</span>
+            <Select
+              value={c.config.logLevel ?? "debug"}
+              onValueChange={(level) =>
+                onConfigChange(c.id, { ...c.config, logLevel: level as CollectorConfig["logLevel"] })
+              }
+            >
+              <SelectTrigger className="w-24 h-8">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {LOG_LEVELS.map((level) => (
+                  <SelectItem key={level} value={level}>
+                    {level.toUpperCase()}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        )}
       </TableCell>
       <TableCell className="text-right">
         <Switch
@@ -1327,36 +1326,49 @@ function JobRow({ job, onRunComplete, cdpConnected }: { job: JobInfo; onRunCompl
 // ---------------------------------------------------------------------------
 
 function SettingsView() {
-  const [settings, setSettings] = useState<AppSettings | null>(_settingsCache.settings);
+  const queryClient = useQueryClient();
+  const { data: settings, isPending } = useQuery({
+    queryKey: ["settings"],
+    queryFn: (): Promise<AppSettings> =>
+      fetch("/api/v1/settings").then((r) => r.json()),
+    staleTime: 30_000,
+  });
 
-  useEffect(() => {
-    fetch("/api/v1/settings")
-      .then((r) => {
-        if (!r.ok) throw new Error(`Settings API returned ${r.status}`);
-        return r.json();
-      })
-      .then((data: AppSettings) => {
-        const s = { ...data, browsers: data.browsers ?? [] };
-        setSettings(s);
-        _settingsCache.settings = s;
-      })
-      .catch(() => {});
-  }, []);
-
-  const updateSettings = useCallback(
-    (update: Partial<AppSettings>) => {
-      if (!settings) return;
-      const merged = { ...settings, ...update };
-      setSettings(merged);
-      _settingsCache.settings = merged;
-      fetch("/api/v1/settings", {
+  const settingsMutation = useMutation({
+    mutationFn: (update: Partial<AppSettings>) => {
+      const current = queryClient.getQueryData<AppSettings>(["settings"]);
+      const merged = { ...(current ?? {}), ...update };
+      return fetch("/api/v1/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(merged),
-      }).catch(() => {});
+      }).then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json() as Promise<AppSettings>;
+      });
     },
-    [settings],
+    onMutate: async (update) => {
+      await queryClient.cancelQueries({ queryKey: ["settings"] });
+      const snapshot = queryClient.getQueryData<AppSettings>(["settings"]);
+      queryClient.setQueryData<AppSettings>(["settings"], (old) =>
+        old ? { ...old, ...update } : old,
+      );
+      return { snapshot };
+    },
+    onError: (_err, _vars, context) => {
+      queryClient.setQueryData(["settings"], context?.snapshot);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["settings"] }),
+  });
+
+  const updateSettings = useCallback(
+    (update: Partial<AppSettings>) => settingsMutation.mutate(update),
+    [settingsMutation],
   );
+
+  if (isPending) {
+    return <div className="text-sm text-muted-foreground">Loading...</div>;
+  }
 
   if (!settings) {
     return <div className="text-sm text-muted-foreground">Loading...</div>;

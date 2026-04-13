@@ -11,10 +11,13 @@
  */
 
 import { execSync, spawn, type ChildProcess } from "node:child_process"
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs"
+import { join } from "node:path"
 import type { BrowserEntry } from "./settings.js"
 import { loadState, saveState, makeSessionName, readCdpPort, type BrowserSession, type StoredSession } from "./state.js"
 import { isAttached } from "./cdp.js"
 import { getLastAttachStartMs } from "./attach-queue.js"
+import { getProfileDir } from "./config.js"
 import { createLogger } from "./logger.js"
 
 const log = createLogger("monitor")
@@ -202,13 +205,54 @@ export function refreshSessions(browsers: BrowserEntry[]): BrowserSession[] {
  */
 export type MonitorEventType = "launch" | "terminate" | "poll" | "activate" | "dialog_dismissed"
 
+/** Path to the PID file tracking the running Swift dialog monitor. */
+function swiftMonitorPidFile(): string {
+  return join(getProfileDir(), "swift-monitor.pid")
+}
+
+/**
+ * Kill the Swift dialog-monitor process recorded in the PID file, if any.
+ *
+ * Called at the start of each `startBrowserMonitor()` invocation to clean up
+ * processes orphaned when a previous backend session exited without calling
+ * `stop()` (e.g. SIGKILL, crash, `node --watch` restart). Orphaned processes
+ * retain their in-memory `dialogAutoAllow` state and keep auto-dismissing the
+ * Chrome remote-debugging dialog even after the backend is reconfigured.
+ *
+ * A PID file is used instead of `pgrep` pattern matching so we only ever
+ * target processes we started ourselves.
+ */
+function killPreviousSwiftMonitor(): void {
+  const pidFile = swiftMonitorPidFile()
+  if (!existsSync(pidFile)) return
+  try {
+    const pid = Number(readFileSync(pidFile, "utf-8").trim())
+    if (pid && pid !== process.pid) {
+      try {
+        process.kill(pid, "SIGTERM")
+        log.info({ pid }, "Killed orphaned Swift dialog monitor from previous session")
+      } catch {
+        // already dead or no permission — ignore
+      }
+    }
+    unlinkSync(pidFile)
+  } catch {
+    // unreadable or already gone — ignore
+  }
+}
+
 export function startBrowserMonitor(
   browsers: BrowserEntry[],
   onUpdate: (event: MonitorEventType) => void,
 ): { stop: () => void; setDialogAutoAllow: (enabled: boolean) => void; triggerDialogBurst: () => void } {
+  // Kill any Swift monitor process orphaned by a previous backend session
+  // before it causes spurious dialog dismissals with stale state.
+  killPreviousSwiftMonitor()
+
   let child: ChildProcess | null = null
   let pollTimer: ReturnType<typeof setInterval> | null = null
   let dialogAutoAllowEnabled = false
+  let exitHandler: (() => void) | null = null
 
   // Browser names for dialog detection (e.g. "Google Chrome", "Google Chrome Canary")
   const browserProcessNames = browsers
@@ -406,6 +450,12 @@ RunLoop.main.run()
     })
     enforceFrontmostCheck = true
 
+    // Record our child's PID so a future backend startup can kill it if we exit
+    // without reaching stop() (SIGKILL, crash, node --watch restart).
+    if (child.pid) {
+      try { writeFileSync(swiftMonitorPidFile(), String(child.pid), "utf-8") } catch { /* ignore */ }
+    }
+
     child.stdout?.setEncoding("utf-8")
     child.stdout?.on("data", (data: string) => {
       for (const line of data.trim().split("\n")) {
@@ -467,12 +517,22 @@ RunLoop.main.run()
 
     child.on("exit", () => {
       child = null
+      // Clean up PID file — process is gone so no future startup needs to kill it
+      try { unlinkSync(swiftMonitorPidFile()) } catch { /* already gone */ }
       // Restart polling if the Swift process dies unexpectedly
       if (!pollTimer) {
         enforceFrontmostCheck = false
         startPolling()
       }
     })
+
+    // Ensure the Swift child is killed on any clean Node.js exit (crash, unhandled
+    // rejection, etc.) — not just the explicit SIGINT/SIGTERM handlers in index.ts.
+    // This prevents the child from becoming an orphan with stale dialogAutoAllow state.
+    // Note: process 'exit' cannot save us from SIGKILL; killOrphanedSwiftMonitors()
+    // handles that case on the next startup.
+    exitHandler = () => { if (child) { child.kill(); child = null } }
+    process.on("exit", exitHandler)
 
     log.debug("Browser monitor started (NSWorkspace + dialog monitor)")
   } catch {
@@ -490,9 +550,14 @@ RunLoop.main.run()
 
   return {
     stop() {
+      if (exitHandler) {
+        process.off("exit", exitHandler)
+        exitHandler = null
+      }
       if (child) {
         child.kill()
         child = null
+        try { unlinkSync(swiftMonitorPidFile()) } catch { /* already gone */ }
       }
       if (pollTimer) {
         clearInterval(pollTimer)

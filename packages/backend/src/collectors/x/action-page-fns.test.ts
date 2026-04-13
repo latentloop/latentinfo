@@ -21,6 +21,7 @@ test("injectActionLogic emits valid JavaScript for each page-side evaluation", a
     async screenshot() { return Buffer.alloc(0) },
     onNotify() {},
     async disposeCollector() {},
+    onCleanup() {},
   }
 
   await injectActionLogic(page, "warn", 0.5)
@@ -44,6 +45,7 @@ test("injectActionLogic rebinds URL-change handling after reinjection so tweet-o
     async screenshot() { return Buffer.alloc(0) },
     onNotify() {},
     async disposeCollector() {},
+    onCleanup() {},
   }
 
   await injectActionLogic(page, "warn", 0.5)

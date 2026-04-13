@@ -79,7 +79,7 @@ export function getSession(sessionName: string): CdpSession | undefined {
   return sessions.get(sessionName)
 }
 
-export function attach(sessionName: string, wsUrl: string, timeoutMs = 5000): Promise<boolean> {
+export function attach(sessionName: string, wsUrl: string, timeoutMs = 5000, onDisconnect?: () => void): Promise<boolean> {
   // Prevent concurrent connections to the same session
   if (attachInProgress.has(sessionName)) {
     log.debug({ sessionName }, "Attach already in progress, skipping")
@@ -162,6 +162,7 @@ export function attach(sessionName: string, wsUrl: string, timeoutMs = 5000): Pr
         // Only delete if we're still the active session.
         if (sessions.get(sessionName) === session) {
           sessions.delete(sessionName)
+          onDisconnect?.()
         }
         log.warn({ sessionName, code, reason: reason?.toString() || "" }, "CDP disconnected")
       })

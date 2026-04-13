@@ -96,7 +96,7 @@ function dispatchNotify(targetId: string, payload: string): void {
 // PageProxy — clean API for collector page handlers, backed by raw CDP
 // ---------------------------------------------------------------------------
 
-function createPageProxy(conn: CdpConnection, target: PageTarget): PageProxy {
+function createPageProxy(conn: CdpConnection, target: PageTarget, sessionCleanups?: (() => void)[]): PageProxy {
   const sid = target.sessionId
 
   async function cdpEval(expression: string): Promise<unknown> {
@@ -239,6 +239,15 @@ function createPageProxy(conn: CdpConnection, target: PageTarget): PageProxy {
         // Page may already be gone — that's fine
       }
     },
+
+    /**
+     * Register a cleanup callback to run when the session ends.
+     * Use this to deregister listeners, timers, or other resources
+     * acquired during the action handler lifecycle.
+     */
+    onCleanup(callback: () => void): void {
+      sessionCleanups?.push(callback)
+    },
   }
 
   return proxy
@@ -261,6 +270,8 @@ export interface PageProxy {
   onNotify(callback: (payload: string) => void): void
   /** Dispose all page-side resources for a collector via ResourceTracker */
   disposeCollector(collectorId: string): Promise<void>
+  /** Register a cleanup callback that runs when the session ends */
+  onCleanup(callback: () => void): void
 }
 
 // ---------------------------------------------------------------------------
@@ -686,7 +697,7 @@ async function checkAndRunCollectors(
     state.injectedTargets.set(target.targetId, injected)
   }
 
-  const proxy = createPageProxy(state.conn, target)
+  const proxy = createPageProxy(state.conn, target, state.cleanups)
 
   // Install shared resource tracker module (once per page)
   if (!injected.has("__resources")) {

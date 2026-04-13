@@ -93,6 +93,7 @@ test("DOM X article extractor page script is valid JavaScript", async () => {
     async screenshot() { return Buffer.alloc(0) },
     onNotify() {},
     async disposeCollector() {},
+    onCleanup() {},
   }
 
   const actual = await match.extract(page)
