@@ -2,12 +2,16 @@ import { useState, useCallback, useEffect, useRef, useMemo, memo } from "react"
 import { useVirtualizer } from "@tanstack/react-virtual"
 import { XHeader } from "@/visualizers/x/header"
 import { ItemCard } from "@/visualizers/x/item-card"
-import { buildDateSections, getGroupColor } from "@/visualizers/x/helpers"
-import type { XItem, XListResponse } from "@/visualizers/x/types"
+import { buildDateSections, getDateStr, getGroupColor } from "@/visualizers/x/helpers"
+import type { XItem, XListResponse, XSummaryResponse } from "@/visualizers/x/types"
 import type { DateSection, ThreadItem } from "@/visualizers/x/helpers"
 import type { FilterToken } from "@/components/filter-bar"
 
-const PAGE_SIZE = 1000
+const INITIAL_FETCH_PAGE_SIZE = 120
+const DAY_FETCH_PAGE_SIZE = 1000
+const DAY_BATCH_COUNT = 2
+const HOUR_GROUP_INITIAL_THREADS = 18
+const HOUR_GROUP_LOAD_MORE_THREADS = 18
 const SSE_DEBOUNCE_MS = 500
 
 import type { DataSource } from "@/components/source-selector"
@@ -44,10 +48,24 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
   )
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const itemsRef = useRef<XItem[]>([])
+  itemsRef.current = items
+  const dateModeRef = useRef(dateMode)
+  dateModeRef.current = dateMode
+  const sortRef = useRef(sort)
+  sortRef.current = sort
+  const loadingRef = useRef(loading)
+  loadingRef.current = loading
+  const loadingMoreRef = useRef(loadingMore)
+  loadingMoreRef.current = loadingMore
+  const [hasMoreDays, setHasMoreDays] = useState(false)
   const [backlogTags, setBacklogTags] = useState<Set<string>>(new Set())
   const [confirmedTags, setConfirmedTags] = useState<Set<string> | undefined>(undefined)
   const fetchGenRef = useRef(0)
+  const loadedDatesRef = useRef<string[]>([])
   const dataFingerprintRef = useRef("")
+  const pendingSseRefreshRef = useRef(false)
 
   // Build query params from tokens + live text
   function buildFilterParams(toks: FilterToken[], live: string): { q: string; user?: string; tag?: string; dateField?: string; dateFrom?: string; dateTo?: string } {
@@ -78,74 +96,275 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
     return { q: textParts.join(" "), user, tag, dateField, dateFrom, dateTo }
   }
 
-  // Fetch all pages of data
-  const fetchAllPages = useCallback(
-    async (dm: string, s: string, filterTokens: FilterToken[], live: string, isPoll = false) => {
-      const gen = ++fetchGenRef.current
-      if (!isPoll) setLoading(true)
+  function dateFieldForMode(dm: string): "tweetAt" | "collectedAt" {
+    return dm === "scrape_date" ? "collectedAt" : "tweetAt"
+  }
+
+  function dayBounds(date: string): { from: string; to: string } {
+    const [year, month, day] = date.split("-").map((part) => parseInt(part, 10))
+    const start = new Date(year, month - 1, day)
+    const end = new Date(year, month - 1, day + 1)
+    return {
+      from: start.toISOString(),
+      to: new Date(end.getTime() - 1).toISOString(),
+    }
+  }
+
+  function boundaryForLoadedDates(dm: string, s: string, dates: string[], params: URLSearchParams): void {
+    if (dates.length === 0) return
+    const sorted = [...dates].sort()
+    const field = dateFieldForMode(dm)
+    params.set("dateField", field)
+    if (s === "asc") {
+      const latest = sorted[sorted.length - 1]!
+      const nextStart = new Date(new Date(dayBounds(latest).to).getTime() + 1).toISOString()
+      params.set("dateFrom", nextStart)
+    } else {
+      const oldest = sorted[0]!
+      const beforeOldest = new Date(new Date(dayBounds(oldest).from).getTime() - 1).toISOString()
+      params.set("dateTo", beforeOldest)
+    }
+  }
+
+  function dedupeItems(list: XItem[]): XItem[] {
+    const seen = new Set<string>()
+    const deduped: XItem[] = []
+    for (const item of list) {
+      if (seen.has(item.info.id)) continue
+      seen.add(item.info.id)
+      deduped.push(item)
+    }
+    return deduped
+  }
+
+  function orderDates(dates: string[], s: string): string[] {
+    const sorted = Array.from(new Set(dates)).sort()
+    return s === "asc" ? sorted : sorted.reverse()
+  }
+
+  function addLoadedDates(dates: string[], s: string): void {
+    if (dates.length === 0) return
+    loadedDatesRef.current = orderDates([...loadedDatesRef.current, ...dates], s)
+  }
+
+  function commitBatch(batch: XItem[]): void {
+    if (batch.length === 0) return
+    const seen = new Set(itemsRef.current.map((item) => item.info.id))
+    const additions = batch.filter((item) => !seen.has(item.info.id))
+    if (additions.length === 0) return
+    const merged = [...itemsRef.current, ...additions]
+    itemsRef.current = merged
+    setItems(merged)
+    setTotal(merged.length)
+  }
+
+  async function fetchSummary(gen: number): Promise<void> {
+    try {
+      const resp = await fetch("/api/v1/x/summary")
+      if (!resp.ok) return
+      const data = await resp.json() as XSummaryResponse
+      if (gen !== fetchGenRef.current) return
+      setTotalUnfiltered(data.total)
+    } catch {
+      // Summary is best-effort; loaded item count remains visible.
+    }
+  }
+
+  async function fetchPage(baseParams: URLSearchParams, offset: number, limit: number): Promise<XListResponse> {
+    const params = new URLSearchParams(baseParams)
+    params.set("offset", String(offset))
+    params.set("limit", String(limit))
+    params.set("slim", "true")
+
+    const resp = await fetch(`/api/v1/x?${params}`)
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    return resp.json() as Promise<XListResponse>
+  }
+
+  async function loadRangePages(
+    baseParams: URLSearchParams,
+    gen: number,
+    onBatch: (batch: XItem[]) => void,
+  ): Promise<XItem[] | null> {
+    let offset = 0
+    let limit = INITIAL_FETCH_PAGE_SIZE
+    const loaded: XItem[] = []
+
+    while (true) {
+      const data = await fetchPage(baseParams, offset, limit)
+      if (gen !== fetchGenRef.current) return null
+      if (data.items.length > 0) {
+        loaded.push(...data.items)
+        onBatch(data.items)
+      }
+      if (!data.hasMore || data.items.length === 0) break
+      offset += data.items.length
+      limit = DAY_FETCH_PAGE_SIZE
+    }
+
+    return loaded
+  }
+
+  async function probeNextDate(
+    dm: string,
+    s: string,
+    baseParams: URLSearchParams,
+    loadedDates: string[],
+  ): Promise<{ date: string } | null> {
+    const probeParams = new URLSearchParams(baseParams)
+    probeParams.set("offset", "0")
+    probeParams.set("limit", "1")
+    probeParams.set("slim", "true")
+    boundaryForLoadedDates(dm, s, loadedDates, probeParams)
+
+    const probeResp = await fetch(`/api/v1/x?${probeParams}`)
+    if (!probeResp.ok) throw new Error(`HTTP ${probeResp.status}`)
+    const probeData: XListResponse = await probeResp.json()
+    const date = probeData.items[0] ? getDateStr(probeData.items[0], dm) : null
+    return date ? { date } : null
+  }
+
+  // Load local-day batches incrementally. The first page commits immediately;
+  // remaining pages continue in the background so first paint is not blocked by
+  // complete-day hydration.
+  const fetchDay = useCallback(
+    async (
+      dm: string,
+      s: string,
+      filterTokens: FilterToken[],
+      live: string,
+      options: { append?: boolean; isPoll?: boolean; refreshDates?: string[] } = {},
+    ) => {
+      const { append = false, isPoll = false, refreshDates } = options
+      const gen = append ? fetchGenRef.current : ++fetchGenRef.current
+      if (!append && !isPoll) {
+        itemsRef.current = []
+        loadedDatesRef.current = []
+        setItems([])
+        setTotal(0)
+        setLoading(true)
+      }
+      if (append) setLoadingMore(true)
       setError(null)
 
       const { q, user, tag, dateField, dateFrom, dateTo } = buildFilterParams(filterTokens, live)
-      let allItems: XItem[] = []
-      let totalCount = 0
+      const hasFilters = Boolean(q || user || tag || dateField)
+      if (!append && !isPoll && !hasFilters) void fetchSummary(gen)
 
       try {
-        let pageCount = 0
-        while (true) {
-          const params = new URLSearchParams({
-            offset: String(allItems.length),
-            limit: String(PAGE_SIZE),
-            dateMode: dm,
-            sort: s,
-            q,
-            slim: "true",
-          })
-          if (user) params.set("user", user)
-          if (tag) params.set("tag", tag)
-          if (dateField && dateFrom && dateTo) {
-            params.set("dateField", dateField)
-            params.set("dateFrom", dateFrom)
-            params.set("dateTo", dateTo)
-          }
-          const resp = await fetch(`/api/v1/x?${params}`)
-          if (!resp.ok) {
-            throw new Error(`HTTP ${resp.status}`)
-          }
-          const data: XListResponse = await resp.json()
-          if (gen !== fetchGenRef.current) return
+        const baseParams = new URLSearchParams({
+          dateMode: dm,
+          sort: s,
+          q,
+        })
+        if (user) baseParams.set("user", user)
+        if (tag) baseParams.set("tag", tag)
 
-          totalCount = data.total
-          if (data.items.length === 0) break
-          allItems = [...allItems, ...data.items]
-          pageCount++
-
-          // Progressive render on first page (initial load only, not polls)
-          if (pageCount === 1 && !isPoll) {
-            setItems([...allItems])
-            setTotal(totalCount)
-            if (!q && !user && !tag && !dateField) setTotalUnfiltered(totalCount)
+        let pollItems: XItem[] = []
+        const receiveBatch = (batch: XItem[]) => {
+          if (isPoll) {
+            pollItems.push(...batch)
+          } else {
+            commitBatch(batch)
           }
-
-          if (allItems.length >= totalCount) break
         }
 
-        if (gen !== fetchGenRef.current) return
+        if (dateField && dateFrom && dateTo) {
+          baseParams.set("dateField", dateField)
+          baseParams.set("dateFrom", dateFrom)
+          baseParams.set("dateTo", dateTo)
+          const rangeItems = await loadRangePages(baseParams, gen, receiveBatch)
+          if (rangeItems === null) return
+          const datesToLoad = Array.from(new Set(rangeItems.map((item) => getDateStr(item, dm)).filter(Boolean) as string[]))
+          loadedDatesRef.current = orderDates(datesToLoad, s)
+          setHasMoreDays(false)
+        } else {
+          let targetDates = refreshDates ? orderDates(refreshDates, s) : []
 
-        // On poll: skip state update if data hasn't changed (prevents repaint flash)
-        const fp = `${totalCount}:${allItems[0]?.info?.id ?? ""}:${allItems[allItems.length - 1]?.info?.id ?? ""}`
-        if (isPoll && fp === dataFingerprintRef.current) return
-        // On poll: never replace existing items with empty result (transient backend issue)
-        if (isPoll && allItems.length === 0 && totalCount === 0) return
-        dataFingerprintRef.current = fp
+          if (isPoll && targetDates.length > 0) {
+            const headProbe = await probeNextDate(dm, s, baseParams, [])
+            if (gen !== fetchGenRef.current) return
+            if (headProbe && !targetDates.includes(headProbe.date)) {
+              targetDates = orderDates([...targetDates, headProbe.date], s)
+            }
+          } else if (targetDates.length === 0) {
+            const probeLoadedDates = append ? [...loadedDatesRef.current] : []
+            for (let i = 0; i < DAY_BATCH_COUNT; i++) {
+              const probe = await probeNextDate(dm, s, baseParams, probeLoadedDates)
+              if (gen !== fetchGenRef.current) return
+              if (!probe) break
+              targetDates.push(probe.date)
+              probeLoadedDates.push(probe.date)
+            }
 
-        setItems(allItems)
-        setTotal(totalCount)
-        if (!q && !user && !tag && !dateField) setTotalUnfiltered(totalCount)
+            if (targetDates.length === 0) {
+              if (!append) {
+                itemsRef.current = []
+                setItems([])
+                setTotal(0)
+                setHasMoreDays(false)
+                loadedDatesRef.current = []
+              } else {
+                setHasMoreDays(false)
+              }
+              return
+            }
+          }
+
+          const completedDates: string[] = []
+          for (const date of targetDates) {
+            const bounds = dayBounds(date)
+            const rangeParams = new URLSearchParams(baseParams)
+            rangeParams.set("dateField", dateFieldForMode(dm))
+            rangeParams.set("dateFrom", bounds.from)
+            rangeParams.set("dateTo", bounds.to)
+            const dayItems = await loadRangePages(rangeParams, gen, receiveBatch)
+            if (gen !== fetchGenRef.current) return
+            if (dayItems === null) return
+            if (dayItems.length > 0) {
+              completedDates.push(date)
+              if (!isPoll) addLoadedDates([date], s)
+            }
+          }
+
+          if (isPoll) {
+            loadedDatesRef.current = orderDates(completedDates, s)
+          }
+          const moreProbe = await probeNextDate(dm, s, baseParams, loadedDatesRef.current)
+          if (gen !== fetchGenRef.current) return
+          setHasMoreDays(Boolean(moreProbe))
+        }
+
+        if (isPoll) {
+          const nextItems = dedupeItems(pollItems)
+          const fp = `${nextItems.length}:${nextItems[0]?.info?.id ?? ""}:${nextItems[nextItems.length - 1]?.info?.id ?? ""}:${loadedDatesRef.current.join(",")}`
+          if (fp === dataFingerprintRef.current) return
+          // Never replace visible items with an empty poll result.
+          if (nextItems.length === 0 && itemsRef.current.length > 0) return
+          dataFingerprintRef.current = fp
+          itemsRef.current = nextItems
+          setItems(nextItems)
+          setTotal(nextItems.length)
+        } else {
+          const currentItems = itemsRef.current
+          dataFingerprintRef.current = `${currentItems.length}:${currentItems[0]?.info?.id ?? ""}:${currentItems[currentItems.length - 1]?.info?.id ?? ""}:${loadedDatesRef.current.join(",")}`
+        }
       } catch (err: any) {
         if (gen !== fetchGenRef.current) return
         setError(err?.message || "Failed to load posts")
       } finally {
-        if (gen === fetchGenRef.current) setLoading(false)
+        if (gen === fetchGenRef.current) {
+          loadingRef.current = false
+          loadingMoreRef.current = false
+          setLoading(false)
+          setLoadingMore(false)
+          if (!isPoll && pendingSseRefreshRef.current) {
+            pendingSseRefreshRef.current = false
+            window.setTimeout(() => {
+              window.dispatchEvent(new CustomEvent("sse:data-changed"))
+            }, 0)
+          }
+        }
       }
     },
     [],
@@ -164,7 +383,7 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
     }
   }, [])
 
-  // Pick up ?q= param when navigating to /data?q=... (Activity keep-alive means no remount)
+  // Pick up ?q= param when navigating to /data?q=...
   const hasFetchedRef = useRef(false)
   useEffect(() => {
     // StrictMode guard: prevent double-fetch in dev
@@ -177,13 +396,13 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
       const newTokens = [{ id: `tok-url-${Date.now()}`, type: "text" as const, label: `"${q}"`, value: q }]
       setTokens(newTokens)
       tokensRef.current = newTokens
-      fetchAllPages(dateMode, sort, newTokens, "")
+      fetchDay(dateMode, sort, newTokens, "")
       // Clean the URL so refreshing doesn't re-apply the filter
       window.history.replaceState({}, "", "/data")
       // Focus the search bar so user can backspace to remove the filter
       setTimeout(() => document.getElementById("searchInput-data")?.focus(), 100)
     } else {
-      fetchAllPages(dateMode, sort, tokens, liveText)
+      fetchDay(dateMode, sort, tokens, liveText)
     }
     fetchTagRegistry()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -195,7 +414,15 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
     const handleSse = () => {
       if (sseDebounce) clearTimeout(sseDebounce)
       sseDebounce = setTimeout(() => {
-        fetchAllPages(dateMode, sort, tokensRef.current, liveTextRef.current, true)
+        if (loadingRef.current || loadingMoreRef.current) {
+          pendingSseRefreshRef.current = true
+          fetchTagRegistry()
+          return
+        }
+        fetchDay(dateModeRef.current, sortRef.current, tokensRef.current, liveTextRef.current, {
+          isPoll: true,
+          refreshDates: loadedDatesRef.current,
+        })
         fetchTagRegistry()
       }, SSE_DEBOUNCE_MS)
     }
@@ -204,7 +431,7 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
       window.removeEventListener("sse:data-changed", handleSse)
       if (sseDebounce) clearTimeout(sseDebounce)
     }
-  }, [fetchAllPages, fetchTagRegistry, dateMode, sort])
+  }, [fetchDay, fetchTagRegistry, dateMode, sort])
 
   // Date mode change
   const handleDateModeChange = useCallback(
@@ -213,9 +440,9 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
       if (typeof localStorage !== "undefined") {
         localStorage.setItem("xviz_dateMode", mode)
       }
-      fetchAllPages(mode, sort, tokensRef.current, liveTextRef.current)
+      fetchDay(mode, sort, tokensRef.current, liveTextRef.current)
     },
-    [fetchAllPages, sort],
+    [fetchDay, sort],
   )
 
   // Sort change
@@ -225,9 +452,9 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
       if (typeof localStorage !== "undefined") {
         localStorage.setItem("xviz_sort", s)
       }
-      fetchAllPages(dateMode, s, tokensRef.current, liveTextRef.current)
+      fetchDay(dateMode, s, tokensRef.current, liveTextRef.current)
     },
-    [fetchAllPages, dateMode],
+    [fetchDay, dateMode],
   )
 
   // Token change — triggers immediate fetch
@@ -235,9 +462,9 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
     (newTokens: FilterToken[]) => {
       setTokens(newTokens)
       tokensRef.current = newTokens
-      fetchAllPages(dateMode, sort, newTokens, liveTextRef.current)
+      fetchDay(dateMode, sort, newTokens, liveTextRef.current)
     },
-    [fetchAllPages, dateMode, sort],
+    [fetchDay, dateMode, sort],
   )
 
   // Live text change — debounced immediate filtering as user types
@@ -248,11 +475,18 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
       liveTextRef.current = text
       if (liveTimerRef.current) clearTimeout(liveTimerRef.current)
       liveTimerRef.current = setTimeout(() => {
-        fetchAllPages(dateMode, sort, tokensRef.current, text)
+        fetchDay(dateMode, sort, tokensRef.current, text)
       }, 200)
     },
-    [fetchAllPages, dateMode, sort],
+    [fetchDay, dateMode, sort],
   )
+
+  const handleLoadMore = useCallback(() => {
+    if (loading || loadingMore || !hasMoreDays) return
+    fetchDay(dateMode, sort, tokensRef.current, liveTextRef.current, {
+      append: true,
+    })
+  }, [dateMode, fetchDay, hasMoreDays, loading, loadingMore, sort])
 
   // Tag filter from item card badge click
   const handleTagFilter = useCallback(
@@ -274,6 +508,7 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
     () => (items.length === 0 ? [] : buildDateSections(items, dateMode)),
     [items, dateMode],
   )
+  const hasActiveFilters = tokens.length > 0 || liveText.trim().length > 0
 
   // ── Section-level virtualizer ──
   // Virtualize at date-section granularity so hour-range groups remain
@@ -348,6 +583,7 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
         onDateModeChange={handleDateModeChange}
         total={total}
         totalUnfiltered={totalUnfiltered}
+        hasActiveFilters={hasActiveFilters}
         error={error}
       />
 
@@ -375,35 +611,49 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
             </p>
           </div>
         ) : (
-          <div style={{ height: virtualizer.getTotalSize(), width: "100%", position: "relative" }}>
-            {virtualizer.getVirtualItems().map((virtualRow) => {
-              const section = sections[virtualRow.index]
-              if (!section) return null
-              return (
-                <div
-                  key={virtualRow.key}
-                  data-index={virtualRow.index}
-                  ref={virtualizer.measureElement}
-                  style={{
-                    position: "absolute",
-                    top: 0,
-                    left: 0,
-                    width: "100%",
-                    transform: `translateY(${virtualRow.start}px)`,
-                  }}
+          <>
+            <div style={{ height: virtualizer.getTotalSize(), width: "100%", position: "relative" }}>
+              {virtualizer.getVirtualItems().map((virtualRow) => {
+                const section = sections[virtualRow.index]
+                if (!section) return null
+                return (
+                  <div
+                    key={virtualRow.key}
+                    data-index={virtualRow.index}
+                    ref={virtualizer.measureElement}
+                    style={{
+                      position: "absolute",
+                      top: 0,
+                      left: 0,
+                      width: "100%",
+                      transform: `translateY(${virtualRow.start}px)`,
+                    }}
+                  >
+                    {virtualRow.index > 0 && (
+                      <div className="flex items-center gap-4 my-3 mx-2">
+                        <div className="flex-1 h-px bg-border" />
+                        <div className="w-0.5 h-0.5 rounded-full bg-border shrink-0" />
+                        <div className="flex-1 h-px bg-border" />
+                      </div>
+                    )}
+                    <DateSectionView section={section} onTagFilter={handleTagFilter} backlogTags={backlogTags} confirmedTags={confirmedTags} />
+                  </div>
+                )
+              })}
+            </div>
+            {hasMoreDays ? (
+              <div className="flex justify-center py-4">
+                <button
+                  type="button"
+                  onClick={handleLoadMore}
+                  disabled={loadingMore}
+                  className="rounded-md border border-border bg-muted px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/80 disabled:opacity-60"
                 >
-                  {virtualRow.index > 0 && (
-                    <div className="flex items-center gap-4 my-3 mx-2">
-                      <div className="flex-1 h-px bg-border" />
-                      <div className="w-0.5 h-0.5 rounded-full bg-border shrink-0" />
-                      <div className="flex-1 h-px bg-border" />
-                    </div>
-                  )}
-                  <DateSectionView section={section} onTagFilter={handleTagFilter} backlogTags={backlogTags} confirmedTags={confirmedTags} />
-                </div>
-              )
-            })}
-          </div>
+                  {loadingMore ? "Loading..." : sort === "asc" ? "Load next 2 days" : "Load previous 2 days"}
+                </button>
+              </div>
+            ) : null}
+          </>
         )}
       </div>
     </div>
@@ -437,11 +687,17 @@ const GroupColumn = memo(function GroupColumn({ name, items, onTagFilter, backlo
   const color = getGroupColor(name)
   const itemCount = items.reduce((n, item) => n + 1 + item.children.length, 0)
   const columnRef = useRef<HTMLDivElement>(null)
+  const [visibleThreadCount, setVisibleThreadCount] = useState(HOUR_GROUP_INITIAL_THREADS)
+  const visibleItems = items.slice(0, visibleThreadCount)
+
+  useEffect(() => {
+    setVisibleThreadCount(HOUR_GROUP_INITIAL_THREADS)
+  }, [name, items[0]?.item.info.id])
 
   const columnVirtualizer = useVirtualizer({
-    count: items.length,
+    count: visibleItems.length,
     getScrollElement: () => columnRef.current,
-    getItemKey: (index) => items[index]?.item.rawData.url ?? index,
+    getItemKey: (index) => visibleItems[index]?.item.rawData.url ?? index,
     estimateSize: () => 180,
     gap: 6,
     overscan: 3,
@@ -457,7 +713,7 @@ const GroupColumn = memo(function GroupColumn({ name, items, onTagFilter, backlo
       </div>
       <div style={{ height: columnVirtualizer.getTotalSize(), position: "relative" }}>
         {columnVirtualizer.getVirtualItems().map((vItem) => {
-          const thread = items[vItem.index]
+          const thread = visibleItems[vItem.index]
           if (!thread) return null
           return (
             <div
@@ -477,6 +733,15 @@ const GroupColumn = memo(function GroupColumn({ name, items, onTagFilter, backlo
           )
         })}
       </div>
+      {visibleItems.length < items.length ? (
+        <button
+          type="button"
+          onClick={() => setVisibleThreadCount((count) => Math.min(items.length, count + HOUR_GROUP_LOAD_MORE_THREADS))}
+          className="mt-2 w-full rounded-md border border-border bg-muted/60 px-2 py-1.5 text-[11px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+        >
+          Show more in {name} ({visibleItems.length}/{items.length})
+        </button>
+      ) : null}
     </div>
   )
 })

@@ -8,10 +8,12 @@ import type { CollectorDefinition } from "../collector-runner.js"
 import xCollector from "./x/index.js"
 import arxivCollector from "./arxiv/index.js"
 import webClipperCollector from "./web_clipper/index.js"
+import githubCollector from "./github/index.js"
 
 const collectors: CollectorDefinition[] = [
   xCollector,
   arxivCollector,
+  githubCollector,
   webClipperCollector,
 ]
 

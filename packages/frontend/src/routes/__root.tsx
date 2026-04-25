@@ -1,16 +1,18 @@
 import { createRootRoute, Link, Outlet, useMatches, useNavigate } from "@tanstack/react-router";
 import { QueryClientProvider } from "@tanstack/react-query";
-import React, { useState, useCallback, useEffect, useRef, Suspense, Activity } from "react";
+import React, { useState, useCallback, useEffect, useRef, Suspense } from "react";
 import { queryClient } from "@/lib/query-client";
 import { Icon } from "@iconify/react";
 import { cn } from "@/lib/utils";
 import { TabContext, type AppTab } from "@/lib/tab-context";
+import type { DataSource } from "@/components/source-selector";
+import { Toaster } from "@/components/ui/sonner";
 const DashboardPage = React.lazy(() => import("./-dashboard.page").then(m => ({ default: m.DashboardPage })));
 const XPage = React.lazy(() => import("./-data.page").then(m => ({ default: m.XPage })));
 const ReaderPage = React.lazy(() => import("./-reader.page").then(m => ({ default: m.ReaderPage })));
 const ArxivPage = React.lazy(() => import("@/visualizers/arxiv/page").then(m => ({ default: m.ArxivPage })));
+const GithubPage = React.lazy(() => import("@/visualizers/github/page").then(m => ({ default: m.GithubPage })));
 const JobRunsPage = React.lazy(() => import("./-jobs.page").then(m => ({ default: m.JobRunsPage })));
-import { Toaster } from "@/components/ui/sonner";
 
 const TAB_BAR_HEIGHT = "2.75rem";
 const LazyFallback = <div className="flex items-center justify-center h-full text-sm text-muted-foreground">Loading...</div>;
@@ -30,10 +32,18 @@ function ShortcutBadge({ n }: { n: number }) {
   );
 }
 
-function DataSourceSwitcher({ source, onSourceChange }: { source: "x" | "arxiv"; onSourceChange: (v: "x" | "arxiv") => void }) {
-  return source === "x"
-    ? <XPage dataSource={source} onDataSourceChange={onSourceChange} />
-    : <ArxivPage dataSource={source} onDataSourceChange={onSourceChange} />;
+function isDataSource(value: string | null): value is DataSource {
+  return value === "x" || value === "arxiv" || value === "github";
+}
+
+function DataSourceSwitcher({ source, onSourceChange }: { source: DataSource; onSourceChange: (v: DataSource) => void }) {
+  if (source === "arxiv") {
+    return <ArxivPage dataSource={source} onDataSourceChange={onSourceChange} />;
+  }
+  if (source === "github") {
+    return <GithubPage dataSource={source} onDataSourceChange={onSourceChange} />;
+  }
+  return <XPage dataSource={source} onDataSourceChange={onSourceChange} />;
 }
 
 function RootLayout() {
@@ -43,9 +53,11 @@ function RootLayout() {
   const pathnameRef = useRef(pathname);
   pathnameRef.current = pathname;
 
-  const [dataSource, setDataSource] = useState<"x" | "arxiv">(
-    () => (typeof localStorage !== "undefined" && localStorage.getItem("latent_dataSource") as "x" | "arxiv") || "x"
-  );
+  const [dataSource, setDataSource] = useState<DataSource>(() => {
+    if (typeof localStorage === "undefined") return "x";
+    const stored = localStorage.getItem("latent_dataSource");
+    return isDataSource(stored) ? stored : "x";
+  });
 
   const [tabs, setTabs] = useState<AppTab[]>([]);
   const [activeTabId, setActiveTabIdRaw] = useState<string | null>(null);
@@ -287,6 +299,22 @@ function RootLayout() {
   const tabBase = "group flex items-center gap-2 h-8 mt-auto px-3 text-xs font-medium rounded-t-md border border-b-0 transition-colors";
   const tabActive = "bg-background text-foreground border-border -mb-px relative z-10 shadow-[inset_0_2px_0_var(--ring)]";
   const tabInactive = "text-muted-foreground border-transparent hover:text-foreground hover:bg-muted/50";
+  const renderMainPage = () => {
+    if (pathname.startsWith("/data")) {
+      return (
+        <DataSourceSwitcher
+          source={dataSource}
+          onSourceChange={(v) => {
+            setDataSource(v);
+            localStorage.setItem("latent_dataSource", v);
+          }}
+        />
+      );
+    }
+    if (pathname.startsWith("/reader")) return <ReaderPage />;
+    if (pathname.startsWith("/jobs")) return <JobRunsPage />;
+    return <DashboardPage />;
+  };
 
   return (
     <QueryClientProvider client={queryClient}>
@@ -352,38 +380,15 @@ function RootLayout() {
 
         {/* Content area */}
         <div className="flex-1 relative min-h-0">
-          {/* Main content — both routes kept alive via Activity */}
           {/* Hidden Outlet keeps TanStack Router's rendering cycle functional */}
           <div className="hidden"><Outlet /></div>
-          {/* Both routes kept alive via Activity — no unmount/remount on switch */}
-          <Activity mode={!showingAppTab && pathname.startsWith("/dashboard") ? "visible" : "hidden"}>
+          {!showingAppTab && (
             <main className="absolute inset-0 overflow-y-auto">
               <Suspense fallback={LazyFallback}>
-                <DashboardPage />
+                {renderMainPage()}
               </Suspense>
             </main>
-          </Activity>
-          <Activity mode={!showingAppTab && pathname.startsWith("/data") ? "visible" : "hidden"}>
-            <main className="absolute inset-0 overflow-y-auto">
-              <Suspense fallback={LazyFallback}>
-                <DataSourceSwitcher source={dataSource} onSourceChange={(v) => { setDataSource(v); localStorage.setItem("latent_dataSource", v) }} />
-              </Suspense>
-            </main>
-          </Activity>
-          <Activity mode={!showingAppTab && pathname.startsWith("/reader") ? "visible" : "hidden"}>
-            <main className="absolute inset-0 overflow-y-auto">
-              <Suspense fallback={LazyFallback}>
-                <ReaderPage />
-              </Suspense>
-            </main>
-          </Activity>
-          <Activity mode={!showingAppTab && pathname.startsWith("/jobs") ? "visible" : "hidden"}>
-            <main className="absolute inset-0 overflow-y-auto">
-              <Suspense fallback={LazyFallback}>
-                <JobRunsPage />
-              </Suspense>
-            </main>
-          </Activity>
+          )}
 
           {/* App tab iframes */}
           {tabs.map((tab) => (

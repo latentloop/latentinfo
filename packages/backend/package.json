@@ -9,7 +9,8 @@
     "bundle": "node scripts/bundle.mjs",
     "dev": "node --watch --watch-path=./src --import=tsx/esm src/index.ts -- --static-dir ../frontend/dist",
     "check-types": "tsc --noEmit",
-    "lint": "echo 'no lint configured'"
+    "check-tracker-discipline": "node scripts/check-tracker-discipline.mjs",
+    "lint": "pnpm check-tracker-discipline"
   },
   "dependencies": {
     "@libsql/client": "^0.17.2",

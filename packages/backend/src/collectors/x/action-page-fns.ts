@@ -516,6 +516,7 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
     if (__tracker) {
       __tracker.addListener("x", window, "scroll", window.__latentScrollFocusHandler, { passive: true });
     } else {
+      // tracker-bypass: __resources install failed — fallback is best-effort; listener leaks on reattach but collector is degraded anyway
       window.addEventListener("scroll", window.__latentScrollFocusHandler, { passive: true });
     }
 
@@ -529,12 +530,18 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
     }
     window.__latentUrlChangeHandler = onUrlMaybeChanged;
     window.__latentOnUrlMaybeChanged = onUrlMaybeChanged;
-    window.addEventListener("popstate", window.__latentUrlChangeHandler);
+    if (__tracker) {
+      __tracker.addListener("x", window, "popstate", window.__latentUrlChangeHandler);
+    } else {
+      // tracker-bypass: __resources install failed — see scroll-handler note above
+      window.addEventListener("popstate", window.__latentUrlChangeHandler);
+    }
     try {
       if (!history.pushState.__latentPatched) {
         var origPush = history.pushState;
         history.pushState = function() {
           var ret = origPush.apply(this, arguments);
+          // tracker-bypass: single-fire 0ms inside persistent history monkey-patch; __latentOnUrlMaybeChanged is stubbed to noop on reattach (collector-runner)
           setTimeout(function() {
             if (window.__latentOnUrlMaybeChanged) window.__latentOnUrlMaybeChanged();
           }, 0);
@@ -546,6 +553,7 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
         var origReplace = history.replaceState;
         history.replaceState = function() {
           var ret = origReplace.apply(this, arguments);
+          // tracker-bypass: single-fire 0ms inside persistent history monkey-patch; __latentOnUrlMaybeChanged is stubbed to noop on reattach (collector-runner)
           setTimeout(function() {
             if (window.__latentOnUrlMaybeChanged) window.__latentOnUrlMaybeChanged();
           }, 0);
@@ -609,7 +617,12 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
       if (delta > 0) executeDown();
       else executeUp();
     };
-    window.addEventListener("keydown", window.__latentKeyHandler, true);
+    if (__tracker) {
+      __tracker.addListener("x", window, "keydown", window.__latentKeyHandler, { capture: true });
+    } else {
+      // tracker-bypass: __resources install failed — see scroll-handler note above
+      window.addEventListener("keydown", window.__latentKeyHandler, true);
+    }
     L("debug", "handler installed, collectAt keys=" + Object.keys(collectAt).length);
   })()`)
 
@@ -621,11 +634,17 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
     var retries = 0;
     var MAX_RETRIES = 10;
     var RETRY_MS = 200;
+    var __tracker = window.__latent && window.__latent.__tracker;
     function tryPatch() {
       if (!window.__latent || !window.__latent.li_x) {
         retries++;
         if (retries <= MAX_RETRIES) {
-          setTimeout(tryPatch, RETRY_MS);
+          if (__tracker) {
+            __tracker.addTimeout("x", tryPatch, RETRY_MS);
+          } else {
+            // tracker-bypass: __resources install failed — see scroll-handler note above
+            setTimeout(tryPatch, RETRY_MS);
+          }
         } else {
           L("warn", "addBadges patch: gave up after " + MAX_RETRIES + " retries (" + (MAX_RETRIES * RETRY_MS) + "ms)");
         }

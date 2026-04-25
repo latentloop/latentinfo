@@ -699,9 +699,23 @@ async function checkAndRunCollectors(
 
   const proxy = createPageProxy(state.conn, target, state.cleanups)
 
-  // Install shared resource tracker module (once per page)
+  // Install shared resource tracker module (once per page per backend process).
+  //
+  // Reattach idempotency: when a prior backend process left resources registered
+  // on this page (tracker + orphaned observers/listeners), we dispose everything
+  // before replacing the tracker reference. Without this, the old observers keep
+  // firing against a closed CDP binding and throw ReferenceError.
+  //
+  // The stub of __latentOnUrlMaybeChanged runs FIRST so the old history.pushState
+  // monkey-patch wrapper can't fire a stale closure during the install window.
   if (!injected.has("__resources")) {
     try {
+      await proxy.evaluate(`(function() {
+        window.__latentOnUrlMaybeChanged = function() {};
+        if (window.__latent && window.__latent.__tracker && typeof window.__latent.__tracker.disposeAll === "function") {
+          try { window.__latent.__tracker.disposeAll(); } catch (e) {}
+        }
+      })()`)
       await proxy.installModule("__resources", {
         createResourceTracker: resourceFns.createResourceTracker,
       })
@@ -717,6 +731,13 @@ async function checkAndRunCollectors(
     if (injected.has(collector.id)) continue
 
     try {
+      // Per-collector reattach safety: clean any residual state registered
+      // under this collector's bucket from a prior same-process re-entry path
+      // (enable → disable → enable, or frameNavigated re-inject). No-op on
+      // cold start. Audit: all current action handlers register under
+      // collector.id (same as pageHandler), so Pass 2 does NOT re-dispose.
+      await proxy.disposeCollector(collector.id)
+
       injected.add(collector.id)
       log.debug(`${ts()} checkAndRunCollectors: running "${collector.id}" on ${target.url.slice(0, 40)}`)
 

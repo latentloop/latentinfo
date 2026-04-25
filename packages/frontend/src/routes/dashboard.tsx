@@ -1,7 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 
-// Route component is a no-op — the real DashboardPage is rendered by __root.tsx
-// via Activity keep-alive.
+// Route component is a no-op — the root layout renders the active page directly.
 export const Route = createFileRoute("/dashboard")({
   component: () => null,
 });

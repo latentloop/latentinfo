@@ -29,6 +29,7 @@ interface XHeaderProps {
   onDateModeChange: (mode: string) => void
   total: number
   totalUnfiltered: number
+  hasActiveFilters: boolean
   error: string | null
 }
 
@@ -42,10 +43,13 @@ export function XHeader({
   onDateModeChange,
   total,
   totalUnfiltered,
+  hasActiveFilters,
   error,
 }: XHeaderProps) {
   const displayTotal = totalUnfiltered || total
-  const hasFilters = tokens.length > 0
+  const countLabel = hasActiveFilters && totalUnfiltered > 0
+    ? formatCount(total) + " / " + formatCount(totalUnfiltered)
+    : formatCount(displayTotal)
 
   return (
     <header className="sticky top-0 z-10 border-b border-border bg-muted px-4 py-1.5">
@@ -58,10 +62,7 @@ export function XHeader({
           </Badge>
         ) : displayTotal > 0 ? (
           <Badge variant="secondary" className="whitespace-nowrap text-[11px] px-1.5 py-0">
-            {hasFilters
-              ? formatCount(total) + " / " + formatCount(displayTotal)
-              : formatCount(displayTotal)}{" "}
-            tweets
+            {countLabel} tweets
           </Badge>
         ) : null}
 

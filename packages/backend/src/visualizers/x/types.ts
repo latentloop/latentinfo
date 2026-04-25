@@ -15,11 +15,14 @@ export interface XDocument {
   quotedTweetUrl: string
   cardLink: string
   parentTweetUrl: string
+  articleHtml?: string
+  articleTitle?: string
   screenshot: string | null
   info?: {
     tags?: string[]
     x_tag_job_run?: number
     x_tag_job_fails?: number
+    articleProcessed?: boolean
   }
 }
 
@@ -37,6 +40,8 @@ export interface XRawData {
   quotedTweetUrl: string
   cardLink: string
   parentTweetUrl: string
+  articleHtml?: string
+  articleTitle?: string
 }
 
 // Collection and derived metadata
@@ -48,6 +53,7 @@ export interface XInfo {
   tweetHour: number
   hasScreenshot: boolean
   tags?: string[]
+  articleProcessed?: boolean
 }
 
 // Item sent to frontend (with derived fields, without screenshot)
@@ -58,7 +64,11 @@ export interface XItem {
 
 export interface XListResponse {
   items: XItem[]
-  total: number
   offset: number
   limit: number
+  hasMore: boolean
+}
+
+export interface XSummaryResponse {
+  total: number
 }

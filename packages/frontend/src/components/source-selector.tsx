@@ -10,11 +10,12 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 
-export type DataSource = "x" | "arxiv"
+export type DataSource = "x" | "arxiv" | "github"
 
 const SOURCES: { value: DataSource; label: string; domain: string }[] = [
   { value: "x", label: "x", domain: "x.com" },
   { value: "arxiv", label: "arxiv", domain: "arxiv.org" },
+  { value: "github", label: "github", domain: "github.com" },
 ]
 
 interface SourceSelectorProps {

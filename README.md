@@ -10,6 +10,7 @@ A misc app for passively collecting and processing info from Chrome (version 144
 |-----------|-----------------|
 | x | Tweet content, media, thread structure |
 | arxiv | Paper metadata (title, authors, abstract, categories) |
+| github | Repository metadata and README markdown |
 | web_clipper | Auto-detected article clips with HTML + markdown |
 
 ### Jobs

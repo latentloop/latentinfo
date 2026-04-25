@@ -3,6 +3,7 @@
  *
  * Routes (path is after /api/v1/x prefix strip):
  * - GET /           → list posts with pagination, search, date mode, sort
+ * - GET /summary    → lightweight archive count
  * - GET /:id        → single post by document ID
  * - GET /:id/screenshot → screenshot as base64 data URI
  * - POST /tags/promote  → promote a backlog tag to confirmed
@@ -12,8 +13,8 @@ import type { IncomingMessage, ServerResponse } from "node:http"
 import { readFileSync, writeFileSync, statSync } from "node:fs"
 import { join } from "node:path"
 import type { Client } from "@libsql/client"
-import { loadCache, getCacheError, findEntry, searchEntries, filterByDateRange, filterByUser, stripScreenshot, stripVerbose, invalidateCache } from "./cache.js"
-import type { XListResponse } from "./types.js"
+import { loadCache, getCacheError, searchEntries, filterByDateRange, filterByUser, stripScreenshot, stripVerbose, invalidateCache, itemFromDoc, normalizeBacklogTagPrefixes } from "./cache.js"
+import type { XDocument, XItem, XListResponse, XSummaryResponse } from "./types.js"
 import { getProfileDir } from "../../config.js"
 import { createLogger } from "../../logger.js"
 
@@ -47,6 +48,38 @@ function sendJson(res: ServerResponse, status: number, data: unknown): void {
   res.end(JSON.stringify(data))
 }
 
+function parseXDoc(rowDoc: string | Record<string, unknown>): XDocument {
+  return typeof rowDoc === "string"
+    ? JSON.parse(rowDoc) as XDocument
+    : rowDoc as unknown as XDocument
+}
+
+function dateExpr(field: "collectedAt" | "tweetAt"): string {
+  return `json_extract(doc, '$.${field}')`
+}
+
+async function hydrateFullPageItems(
+  db: Client,
+  entries: Array<{ id: string; doc: XDocument; collectedAt: string; hasScreenshot: boolean }>,
+): Promise<XItem[]> {
+  if (entries.length === 0) return []
+
+  const ids = entries.map((entry) => entry.id)
+  const result = await db.execute({
+    sql: `SELECT id, json_remove(doc, '$.screenshot') AS doc, CASE WHEN json_extract(doc, '$.screenshot') IS NOT NULL AND json_extract(doc, '$.screenshot') != '' THEN 1 ELSE 0 END AS has_screenshot FROM documents WHERE id IN (${ids.map(() => "?").join(",")})`,
+    args: ids,
+  })
+  const byId = new Map<string, XItem>()
+  for (const row of result.rows as Array<{ id?: string; doc?: string | Record<string, unknown>; has_screenshot?: number }>) {
+    if (!row.id || !row.doc) continue
+    const doc = parseXDoc(row.doc)
+    normalizeBacklogTagPrefixes(doc)
+    byId.set(row.id, itemFromDoc(row.id, doc, !!row.has_screenshot))
+  }
+
+  return entries.map((entry) => byId.get(entry.id) ?? stripScreenshot(entry))
+}
+
 export async function handleXApi(
   path: string,
   query: URLSearchParams,
@@ -58,19 +91,92 @@ export async function handleXApi(
   const normalizedPath = ("/" + path.replace(/^\/+/, "")).replace(/\/+$/, "") || "/"
   const method = (req.method || "GET").toUpperCase()
 
+  // GET /summary → exact archive count. Kept separate so list/range requests
+  // can stream pages without paying count cost on every request.
+  if (normalizedPath === "/summary" && method === "GET") {
+    const result = await db.execute(
+      "SELECT COUNT(*) AS cnt FROM documents WHERE json_extract(doc, '$.type') = 'x'",
+    )
+    const response: XSummaryResponse = {
+      total: Number(result.rows[0]?.cnt ?? 0),
+    }
+    sendJson(res, 200, response)
+    return
+  }
+
   // GET / → list posts
   if (normalizedPath === "/" || normalizedPath === "") {
-    const cache = await loadCache(db)
-    if (!cache) {
-      sendJson(res, 500, { error: getCacheError() || "DB not available" })
-      return
-    }
-
     const offset = Math.max(0, parseInt(query.get("offset") || "0", 10) || 0)
     const limit = Math.min(5000, Math.max(1, parseInt(query.get("limit") || "1000", 10) || 1000))
     const dateMode = query.get("dateMode") || "post_date"
     const sort = query.get("sort") || "desc"
     const q = (query.get("q") || "").trim()
+
+    // SQL page path for unfiltered date-order/range views. It avoids hydrating
+    // the full X cache and uses limit+1 to derive hasMore without COUNT(*).
+    const userFilter = (query.get("user") || "").trim()
+    const dateField = query.get("dateField") as "tweetAt" | "collectedAt" | null
+    const dateFrom = query.get("dateFrom") || ""
+    const dateTo = query.get("dateTo") || ""
+    const tagFilter = (query.get("tag") || "").trim()
+    const orderField = dateMode === "scrape_date" ? "collectedAt" : "tweetAt"
+    const rangeField = dateField === "collectedAt" || dateField === "tweetAt" ? dateField : null
+    const canUseSqlPage =
+      !q &&
+      !userFilter &&
+      !tagFilter
+
+    if (canUseSqlPage) {
+      const where: string[] = ["json_extract(doc, '$.type') = 'x'"]
+      const whereArgs: Array<string | number> = []
+      if (rangeField) {
+        if (dateFrom) {
+          where.push(`${dateExpr(rangeField)} >= ?`)
+          whereArgs.push(dateFrom)
+        }
+        if (dateTo) {
+          where.push(`${dateExpr(rangeField)} <= ?`)
+          whereArgs.push(dateTo)
+        }
+      }
+      const whereClause = where.join(" AND ")
+      const direction = sort === "asc" ? "ASC" : "DESC"
+      const orderExpr = dateExpr(orderField)
+      const indexName = orderField === "collectedAt" ? "idx_doc_x_collected_at" : "idx_doc_x_tweet_at"
+      const slim = query.get("slim") === "true"
+      const docSelect = slim
+        ? "json_remove(doc, '$.screenshot', '$.avatarUrl', '$.imageUrls', '$.articleHtml') AS doc"
+        : "json_remove(doc, '$.screenshot') AS doc"
+      const pageResult = await db.execute({
+        sql: `SELECT id, ${docSelect}, CASE WHEN json_extract(doc, '$.screenshot') IS NOT NULL AND json_extract(doc, '$.screenshot') != '' THEN 1 ELSE 0 END AS has_screenshot FROM documents INDEXED BY ${indexName} WHERE ${whereClause} ORDER BY ${orderExpr} ${direction} LIMIT ? OFFSET ?`,
+        args: [...whereArgs, limit + 1, offset],
+      })
+      const rows = pageResult.rows.slice(0, limit)
+      const items = rows.map((row: any) => {
+        const doc = parseXDoc(row.doc)
+        normalizeBacklogTagPrefixes(doc)
+        const item = itemFromDoc(String(row.id || ""), doc, !!row.has_screenshot)
+        if (slim) {
+          item.rawData.contentLinks = []
+          item.rawData.imageUrls = []
+        }
+        return item
+      })
+      const response: XListResponse = {
+        items,
+        offset,
+        limit,
+        hasMore: pageResult.rows.length > limit,
+      }
+      sendJson(res, 200, response)
+      return
+    }
+
+    const cache = await loadCache(db)
+    if (!cache) {
+      sendJson(res, 500, { error: getCacheError() || "DB not available" })
+      return
+    }
 
     let indices = dateMode === "scrape_date" ? cache.byCollectedAt : cache.byPostDate
 
@@ -80,16 +186,12 @@ export async function handleXApi(
     }
 
     // User filter
-    const userFilter = (query.get("user") || "").trim()
     if (userFilter) {
       indices = filterByUser(cache, indices, userFilter)
     }
 
     // Date range filter
-    const dateField = query.get("dateField") as "tweetAt" | "collectedAt" | null
-    const dateFrom = query.get("dateFrom") || ""
-    const dateTo = query.get("dateTo") || ""
-    if (dateField && dateFrom && dateTo) {
+    if (dateField && (dateFrom || dateTo)) {
       indices = filterByDateRange(cache, indices, dateField, dateFrom, dateTo)
     }
 
@@ -98,7 +200,6 @@ export async function handleXApi(
     }
 
     // Tag filter
-    const tagFilter = (query.get("tag") || "").trim()
     if (tagFilter) {
       indices = indices.filter((i) => {
         const tags = cache.entries[i].doc.info?.tags
@@ -106,12 +207,19 @@ export async function handleXApi(
       })
     }
 
-    const total = indices.length
-    const page = indices.slice(offset, offset + limit)
+    const page = indices.slice(offset, offset + limit + 1)
     const slim = query.get("slim") === "true"
-    const items = page.map((i) => slim ? stripVerbose(cache.entries[i]) : stripScreenshot(cache.entries[i]))
+    const pageEntries = page.slice(0, limit).map((i) => cache.entries[i])
+    const items = slim
+      ? pageEntries.map((entry) => stripVerbose(entry))
+      : await hydrateFullPageItems(db, pageEntries)
 
-    const response: XListResponse = { items, total, offset, limit }
+    const response: XListResponse = {
+      items,
+      offset,
+      limit,
+      hasMore: page.length > limit,
+    }
     sendJson(res, 200, response)
     return
   }
@@ -265,24 +373,24 @@ export async function handleXApi(
     return
   }
 
-  // Match /:id → single post
+  // Match /:id → single post. Query directly so the list cache can stay slim.
   const idMatch = normalizedPath.match(/^\/(.+)$/)
   if (idMatch) {
-    const id = decodeURIComponent(idMatch[1]!)
-    const cache = await loadCache(db)
-    if (!cache) {
-      sendJson(res, 500, { error: getCacheError() || "DB not available" })
+    const rawId = decodeURIComponent(idMatch[1]!)
+    const ids = rawId.startsWith("x:") ? [rawId] : [rawId, `x:${rawId}`]
+    for (const id of ids) {
+      const result = await db.execute({
+        sql: "SELECT json_remove(doc, '$.screenshot') AS doc, CASE WHEN json_extract(doc, '$.screenshot') IS NOT NULL AND json_extract(doc, '$.screenshot') != '' THEN 1 ELSE 0 END AS has_screenshot FROM documents WHERE id = ? AND json_extract(doc, '$.type') = 'x' LIMIT 1",
+        args: [id],
+      })
+      const row = result.rows[0] as { doc?: string | Record<string, unknown>; has_screenshot?: number } | undefined
+      if (!row?.doc) continue
+      const doc = parseXDoc(row.doc)
+      sendJson(res, 200, { item: itemFromDoc(id, doc, !!row.has_screenshot) })
       return
     }
 
-    const idx = findEntry(cache, { id })
-    if (idx === undefined) {
-      sendJson(res, 404, { error: "Not found" })
-      return
-    }
-
-    const item = stripScreenshot(cache.entries[idx])
-    sendJson(res, 200, { item })
+    sendJson(res, 404, { error: "Not found" })
     return
   }
 

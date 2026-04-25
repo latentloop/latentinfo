@@ -35,7 +35,11 @@ export interface XItem {
 
 export interface XListResponse {
   items: XItem[]
-  total: number
   offset: number
   limit: number
+  hasMore: boolean
+}
+
+export interface XSummaryResponse {
+  total: number
 }

@@ -22,11 +22,14 @@ export interface XDocument extends DocumentBase {
   quotedTweetUrl: string
   cardLink: string
   parentTweetUrl: string
+  articleHtml?: string
+  articleTitle?: string
   screenshot: string | null
   info?: {
     tags?: string[]
     x_tag_job_run?: number
     x_tag_job_fails?: number
+    articleProcessed?: boolean
   }
 }
 

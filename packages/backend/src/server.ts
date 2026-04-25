@@ -130,6 +130,10 @@ function sendJson(res: ServerResponse, status: number, data: unknown): void {
   res.end(JSON.stringify(data))
 }
 
+function documentIdRange(prefix: string): [string, string] {
+  return [`${prefix}:`, `${prefix};`]
+}
+
 const MAX_BODY_BYTES = 1024 * 1024 // 1 MB
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -236,32 +240,25 @@ export async function startServer(config: ServerConfig): Promise<ServerHandle> {
 
     // Status
     if (pathname === "/api/v1/status" && method === "GET") {
-      // Aggregate document stats per collector in a single query
       let totalDocuments = 0
       let lastCollectionTime: string | null = null
       const collectorStats: { id: string; documentCount: number; lastCollectionTime: string | null }[] = []
 
       try {
-        const statsResult = await db.execute(
-          `SELECT
-             substr(id, 1, instr(id, ':') - 1) AS prefix,
-             COUNT(*) AS cnt,
-             MAX(json_extract(doc, '$.collectedAt')) AS latest_ca
-           FROM documents
-           WHERE instr(id, ':') > 0
-           GROUP BY prefix`,
-        )
-        const statsMap = new Map<string, { cnt: number; latestCa: string | null }>()
-        for (const row of statsResult.rows) {
-          statsMap.set(
-            String(row.prefix),
-            { cnt: Number(row.cnt ?? 0), latestCa: (row.latest_ca as string) ?? null },
-          )
-        }
         for (const viz of visualizers) {
-          const stat = statsMap.get(viz.id)
-          const docCount = stat?.cnt ?? 0
-          const latestTime = stat?.latestCa ?? null
+          const [rangeStart, rangeEnd] = documentIdRange(viz.id)
+          const [countResult, latestResult] = await Promise.all([
+            db.execute({
+              sql: "SELECT COUNT(*) AS cnt FROM documents WHERE id >= ? AND id < ?",
+              args: [rangeStart, rangeEnd],
+            }),
+            db.execute({
+              sql: "SELECT json_extract(doc, '$.collectedAt') AS latest_ca FROM documents INDEXED BY idx_doc_collected_at WHERE id >= ? AND id < ? ORDER BY json_extract(doc, '$.collectedAt') DESC LIMIT 1",
+              args: [rangeStart, rangeEnd],
+            }),
+          ])
+          const docCount = Number(countResult.rows[0]?.cnt ?? 0)
+          const latestTime = (latestResult.rows[0]?.latest_ca as string | undefined) ?? null
           totalDocuments += docCount
           if (latestTime && (!lastCollectionTime || latestTime > lastCollectionTime)) {
             lastCollectionTime = latestTime

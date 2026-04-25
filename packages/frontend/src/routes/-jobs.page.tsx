@@ -158,7 +158,7 @@ export function JobRunsPage() {
       }
     }
     window.addEventListener("popstate", handler)
-    // Also run on mount in case Activity re-shows with new URL
+    // Also run on mount so direct /jobs?job=... links apply immediately.
     handler()
     return () => window.removeEventListener("popstate", handler)
   }, [])

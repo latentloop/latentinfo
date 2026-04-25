@@ -49,6 +49,8 @@ export async function initDatabase(): Promise<Client> {
     );
     CREATE INDEX IF NOT EXISTS idx_doc_type ON documents(json_extract(doc, '$.type'));
     CREATE INDEX IF NOT EXISTS idx_doc_collected_at ON documents(json_extract(doc, '$.collectedAt'));
+    CREATE INDEX IF NOT EXISTS idx_doc_x_collected_at ON documents(json_extract(doc, '$.type'), json_extract(doc, '$.collectedAt'));
+    CREATE INDEX IF NOT EXISTS idx_doc_x_tweet_at ON documents(json_extract(doc, '$.type'), json_extract(doc, '$.tweetAt'));
     CREATE INDEX IF NOT EXISTS idx_job_runs_job_started ON job_runs(job_id, started_at);
     CREATE INDEX IF NOT EXISTS idx_articles_source_key ON articles(source_key);
     CREATE INDEX IF NOT EXISTS idx_articles_created_at ON articles(created_at DESC);

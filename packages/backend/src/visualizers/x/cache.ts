@@ -5,7 +5,7 @@
  * - Parses JSONB doc column to XDocument
  * - Builds sorted indices (byPostDate, byCollectedAt)
  * - Builds lookup maps (urlIndex, idIndex)
- * - Strips screenshot from list responses
+ * - Strips heavy media from the list cache; detail endpoints fetch full docs.
  */
 
 import type { Client } from "@libsql/client"
@@ -56,6 +56,8 @@ export function stripScreenshot(entry: CacheEntry): XItem {
       quotedTweetUrl: doc.quotedTweetUrl || "",
       cardLink: doc.cardLink || "",
       parentTweetUrl: doc.parentTweetUrl || "",
+      articleHtml: doc.articleHtml,
+      articleTitle: doc.articleTitle,
     },
     info: {
       id: entry.id,
@@ -65,6 +67,7 @@ export function stripScreenshot(entry: CacheEntry): XItem {
       tweetHour: doc.tweetHour || 0,
       hasScreenshot: entry.hasScreenshot,
       tags: doc.info?.tags,
+      articleProcessed: doc.info?.articleProcessed,
     },
   }
 }
@@ -77,7 +80,30 @@ export function stripVerbose(entry: CacheEntry): XItem {
   const item = stripScreenshot(entry)
   item.rawData.contentLinks = []
   item.rawData.imageUrls = []
+  item.rawData.articleHtml = undefined
   return item
+}
+
+export function itemFromDoc(id: string, doc: XDocument, hasScreenshot: boolean): XItem {
+  return stripScreenshot({
+    doc,
+    id,
+    collectedAt: doc.collectedAt || "",
+    hasScreenshot,
+  })
+}
+
+export function normalizeBacklogTagPrefixes(doc: XDocument): boolean {
+  if (!doc.info?.tags || !Array.isArray(doc.info.tags)) return false
+  let changed = false
+  doc.info.tags = doc.info.tags.map((tag) => {
+    if (tag.startsWith("backlog:")) {
+      changed = true
+      return tag.slice("backlog:".length)
+    }
+    return tag
+  })
+  return changed
 }
 
 export async function loadCache(db: Client): Promise<XCache | null> {
@@ -86,13 +112,14 @@ export async function loadCache(db: Client): Promise<XCache | null> {
 
   try {
     const t0 = Date.now()
-    // Exclude screenshot data from cache load — screenshots are fetched individually via /:id/screenshot
+    // Exclude bulky media from the list cache. Full text/data views fetch the
+    // single document directly, and screenshots keep their dedicated endpoint.
     const result = await db.execute(
-      "SELECT id, json_remove(doc, '$.screenshot') AS doc, CASE WHEN json_extract(doc, '$.screenshot') IS NOT NULL AND json_extract(doc, '$.screenshot') != '' THEN 1 ELSE 0 END AS has_screenshot FROM documents WHERE json_extract(doc, '$.type') = 'x'",
+      "SELECT id, json_remove(doc, '$.screenshot', '$.avatarUrl', '$.imageUrls', '$.articleHtml') AS doc, CASE WHEN json_extract(doc, '$.screenshot') IS NOT NULL AND json_extract(doc, '$.screenshot') != '' THEN 1 ELSE 0 END AS has_screenshot FROM documents WHERE json_extract(doc, '$.type') = 'x'",
     )
     const queryMs = Date.now() - t0
 
-    const docsToClean: Array<{ id: string; doc: XDocument }> = []
+    const docsToClean: Array<{ id: string; tags: string[] }> = []
     const entries: CacheEntry[] = result.rows.map((row: any) => {
       let doc: XDocument
       try {
@@ -101,19 +128,8 @@ export async function loadCache(db: Client): Promise<XCache | null> {
         doc = {} as XDocument
       }
 
-      // Strip backlog: prefix from tags in-memory and collect for async DB write-back
-      if (doc.info?.tags && Array.isArray(doc.info.tags)) {
-        let changed = false
-        doc.info.tags = doc.info.tags.map((t) => {
-          if (t.startsWith("backlog:")) {
-            changed = true
-            return t.slice("backlog:".length)
-          }
-          return t
-        })
-        if (changed) {
-          docsToClean.push({ id: String(row.id || ""), doc })
-        }
+      if (normalizeBacklogTagPrefixes(doc)) {
+        docsToClean.push({ id: String(row.id || ""), tags: doc.info?.tags ?? [] })
       }
 
       return {
@@ -165,11 +181,11 @@ export async function loadCache(db: Client): Promise<XCache | null> {
       log.info(`Cleaning backlog: prefix from ${docsToClean.length} documents (async)`)
       ;(async () => {
         try {
-          for (const { id, doc } of docsToClean) {
+          for (const { id, tags } of docsToClean) {
             try {
               await db.execute({
-                sql: "UPDATE documents SET doc = json(?) WHERE id = ?",
-                args: [JSON.stringify(doc), id],
+                sql: "UPDATE documents SET doc = json_set(doc, '$.info.tags', json(?)) WHERE id = ?",
+                args: [JSON.stringify(tags), id],
               })
             } catch (e: any) {
               log.warn("Failed to clean prefix for " + id + ": " + (e.message || e))
@@ -225,7 +241,9 @@ export function filterByDateRange(
   return indices.filter((i) => {
     const doc = c.entries[i].doc
     const val = field === "tweetAt" ? (doc.tweetAt || "") : (c.entries[i].collectedAt || "")
-    return val >= from && val <= to
+    if (from && val < from) return false
+    if (to && val > to) return false
+    return true
   })
 }
 

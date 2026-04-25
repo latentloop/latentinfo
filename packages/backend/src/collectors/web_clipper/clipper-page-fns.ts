@@ -182,11 +182,21 @@ export function initClipMode() {
     }
   }
 
-  document.addEventListener("mousemove", onMouseMove, true)
-  document.addEventListener("click", onClick, true)
-  document.addEventListener("keydown", onKeyDown, true)
+  var __tracker = window.__latent && window.__latent.__tracker
+  if (__tracker) {
+    __tracker.addListener("web_clip:clip_mode", document, "mousemove", onMouseMove, { capture: true })
+    __tracker.addListener("web_clip:clip_mode", document, "click", onClick, { capture: true })
+    __tracker.addListener("web_clip:clip_mode", document, "keydown", onKeyDown, { capture: true })
+  } else {
+    // tracker-bypass: __resources install failed — fallback is best-effort; exitClipMode still removes these explicitly
+    document.addEventListener("mousemove", onMouseMove, true)
+    // tracker-bypass: see else-branch preamble above
+    document.addEventListener("click", onClick, true)
+    // tracker-bypass: see else-branch preamble above
+    document.addEventListener("keydown", onKeyDown, true)
+  }
 
-  // Store handler references for cleanup
+  // Store handler references for explicit cleanup on user cancel (tracker cleans them on reattach)
   window.__latentClipState._onMouseMove = onMouseMove
   window.__latentClipState._onClick = onClick
   window.__latentClipState._onKeyDown = onKeyDown
@@ -199,7 +209,11 @@ export function initClipMode() {
  */
 export function exitClipMode() {
   var state = window.__latentClipState
-  if (state) {
+  var __tracker = window.__latent && window.__latent.__tracker
+  if (__tracker) {
+    __tracker.disposeCollector("web_clip:clip_mode")
+  } else if (state) {
+    // tracker-bypass: fallback path matches the tracker-bypass install branch in initClipMode
     if (state._onMouseMove) document.removeEventListener("mousemove", state._onMouseMove, true)
     if (state._onClick) document.removeEventListener("click", state._onClick, true)
     if (state._onKeyDown) document.removeEventListener("keydown", state._onKeyDown, true)
@@ -503,6 +517,7 @@ export function initAutoClipButton(opts) {
     // Brief visual feedback
     btn.style.color = "#3b82f6"
     btn.style.boxShadow = "0 0 6px rgba(59,130,246,0.5)"
+    // tracker-bypass: single-fire 600ms visual-feedback inside user click handler
     setTimeout(function () {
       btn.style.color = "rgba(255,255,255,0.6)"
       btn.style.boxShadow = "none"
@@ -598,8 +613,19 @@ export function showClipToast(opts) {
   toast.style.display = "block"
 
   // Auto-dismiss after 5 seconds
-  window.__latentClipToastTimer = setTimeout(function () {
-    toast.style.opacity = "0"
-    setTimeout(function () { toast.style.display = "none" }, 300)
-  }, 5000)
+  var __tracker = window.__latent && window.__latent.__tracker
+  if (__tracker) {
+    window.__latentClipToastTimer = __tracker.addTimeout("web_clip", function () {
+      toast.style.opacity = "0"
+      // tracker-bypass: single-fire 300ms hide animation; short-lived
+      setTimeout(function () { toast.style.display = "none" }, 300)
+    }, 5000)
+  } else {
+    // tracker-bypass: __resources install failed — fallback
+    window.__latentClipToastTimer = setTimeout(function () {
+      toast.style.opacity = "0"
+      // tracker-bypass: single-fire hide animation inside fallback toast
+      setTimeout(function () { toast.style.display = "none" }, 300)
+    }, 5000)
+  }
 }

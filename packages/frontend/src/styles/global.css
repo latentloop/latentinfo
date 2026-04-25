@@ -118,6 +118,120 @@ body {
   border-color: #58a6ff;
 }
 
+.github-readme-content {
+  font-size: 12px;
+  line-height: 1.6;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+.github-readme-content h1 {
+  font-size: 1.35em;
+  font-weight: 700;
+  line-height: 1.25;
+  margin: 0.2em 0 0.6em;
+  color: var(--foreground);
+}
+.github-readme-content h2 {
+  font-size: 1.18em;
+  font-weight: 650;
+  line-height: 1.3;
+  margin: 1em 0 0.45em;
+  color: var(--foreground);
+}
+.github-readme-content h3 {
+  font-size: 1.05em;
+  font-weight: 650;
+  line-height: 1.35;
+  margin: 0.9em 0 0.35em;
+  color: var(--foreground);
+}
+.github-readme-content p,
+.github-readme-content ul,
+.github-readme-content ol,
+.github-readme-content blockquote,
+.github-readme-content pre,
+.github-readme-content table {
+  margin-bottom: 0.75em;
+}
+.github-readme-content a {
+  color: var(--ring);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.github-readme-content a:hover {
+  opacity: 0.85;
+}
+.github-readme-content ul,
+.github-readme-content ol {
+  padding-left: 1.4em;
+}
+.github-readme-content ul {
+  list-style: disc;
+}
+.github-readme-content ol {
+  list-style: decimal;
+}
+.github-readme-content li {
+  margin-bottom: 0.25em;
+}
+.github-readme-content blockquote {
+  border-left: 3px solid var(--border);
+  color: var(--muted-foreground);
+  padding-left: 0.8em;
+}
+.github-readme-content pre {
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.92em;
+  line-height: 1.5;
+  overflow-x: auto;
+  padding: 10px 12px;
+}
+.github-readme-content code {
+  background: var(--muted);
+  border-radius: 3px;
+  font-size: 0.92em;
+  padding: 1px 4px;
+}
+.github-readme-content pre code {
+  background: none;
+  border-radius: 0;
+  padding: 0;
+}
+.github-readme-content img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+  margin: 0.65em 0;
+}
+.github-readme-content a:has(img) {
+  display: inline-block;
+  text-decoration: none;
+}
+.github-readme-content table {
+  border-collapse: collapse;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.github-readme-content th,
+.github-readme-content td {
+  border: 1px solid var(--border);
+  padding: 5px 7px;
+  text-align: left;
+}
+.github-readme-content th {
+  background: var(--muted);
+  color: var(--foreground);
+  font-weight: 650;
+}
+.github-readme-content hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1em 0;
+}
+
 /* macOS Electron title bar drag region */
 .app-drag-region {
   -webkit-app-region: drag;

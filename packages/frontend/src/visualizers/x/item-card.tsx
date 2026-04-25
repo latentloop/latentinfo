@@ -121,6 +121,7 @@ export const ItemCard = memo(function ItemCard({ item: t, onTagFilter, backlogTa
   const [fullItem, setFullItem] = useState<XItem | null>(null)
   const [loadingDetail, setLoadingDetail] = useState(false)
   const loadedRef = useRef(false)
+  const detailRequestedRef = useRef(false)
   const cardRef = useRef<HTMLDivElement>(null)
   const [imgMenu, setImgMenu] = useState<ImgMenuState | null>(null)
   const imgMenuRef = useRef<HTMLDivElement>(null)
@@ -131,16 +132,26 @@ export const ItemCard = memo(function ItemCard({ item: t, onTagFilter, backlogTa
   const displayItem = fullItem || t
   const raw = displayItem.rawData
 
-  // Lazy-fetch full item detail when switching to text or data mode
+  // Lazy-fetch full item detail when text/data is actually viewed. The list
+  // payload intentionally omits bulky media fields.
   const handleViewModeChange = useCallback((mode: ViewMode) => {
     setViewMode(mode)
-    if (mode !== "screenshot" && !fullItem && !loadingDetail) {
-      setLoadingDetail(true)
-      fetchDetail(info.id).then((item) => {
-        if (item) setFullItem(item)
-      }).finally(() => setLoadingDetail(false))
-    }
-  }, [info.id, fullItem, loadingDetail])
+  }, [])
+
+  useEffect(() => {
+    detailRequestedRef.current = false
+    setFullItem(detailCache.get(info.id) ?? null)
+    setLoadingDetail(false)
+  }, [info.id])
+
+  useEffect(() => {
+    if (viewMode === "screenshot" || fullItem || loadingDetail || detailRequestedRef.current) return
+    detailRequestedRef.current = true
+    setLoadingDetail(true)
+    fetchDetail(info.id).then((item) => {
+      if (item) setFullItem(item)
+    }).finally(() => setLoadingDetail(false))
+  }, [info.id, viewMode, fullItem, loadingDetail])
 
   // Lazy-load screenshot only when card enters viewport
   useEffect(() => {

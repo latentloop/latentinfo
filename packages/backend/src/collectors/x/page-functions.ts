@@ -334,6 +334,7 @@ export function waitForScrollIdle(opts) {
       if (now - startAt >= timeoutMs) { finish(false); return }
       rafId = window.requestAnimationFrame(tick)
     }
+    // tracker-bypass: one-shot promise-based scroll-idle waiter; self-cleans via finish() and bounded by timeoutMs
     window.addEventListener("scroll", onScroll, { passive: true })
     rafId = window.requestAnimationFrame(tick)
   })
@@ -432,8 +433,10 @@ export function cropScreenshot(opts) {
  * startWatching — set up MutationObserver + scroll listener to detect new tweets.
  */
 export function startWatching(opts) {
-  if (window[opts.watchingFlag]) return
-  window[opts.watchingFlag] = true
+  // Duplicate-install protection lives at the orchestrator level
+  // (`if (injected.has(collector.id)) continue` in checkAndRunCollectors).
+  // Across process boundaries, the tracker-level disposeAll() run before
+  // __resources reinstall ensures prior observers are gone.
   var modName = opts.appName
   var notifyKey = opts.notifyKey
   var notifyTimer = null
@@ -490,6 +493,7 @@ export function startWatching(opts) {
     var delay = Math.max(0, dueAt - Date.now())
     if (notifyTimer) clearTimeout(notifyTimer)
     notifyDueAt = dueAt
+    // tracker-bypass: short-lived self-clearing timer; fireNotify guards __latentInfoNotify with typeof check
     notifyTimer = setTimeout(function() {
       notifyTimer = null
       notifyDueAt = 0
@@ -502,6 +506,7 @@ export function startWatching(opts) {
     var visibleCount = countVisibleUnbadgedTweets()
     if (visibleCount <= 0) {
       if (attempt < EMPTY_RETRIES) {
+        // tracker-bypass: short-lived retry timer; fireNotify guards __latentInfoNotify with typeof check
         notifyTimer = setTimeout(function() {
           notifyTimer = null
           fireNotify(attempt + 1)
@@ -514,12 +519,14 @@ export function startWatching(opts) {
     }
     var now = Date.now()
     lastNotifyAt = now
-    __latentInfoNotify(JSON.stringify({
-      key: notifyKey,
-      reason: pendingReason || "unknown",
-      visibleCount: visibleCount,
-      detectedAt: pendingDetectedAt || now,
-    }))
+    if (typeof window.__latentInfoNotify === "function") {
+      window.__latentInfoNotify(JSON.stringify({
+        key: notifyKey,
+        reason: pendingReason || "unknown",
+        visibleCount: visibleCount,
+        detectedAt: pendingDetectedAt || now,
+      }))
+    }
     pendingReason = "unknown"
     pendingDetectedAt = 0
   }
@@ -558,6 +565,7 @@ export function startWatching(opts) {
     var reason = direction === "up" ? "scroll_up" : "scroll"
     scheduleNotify(reason, "scroll", direction)
     if (scrollIdleTimer) clearTimeout(scrollIdleTimer)
+    // tracker-bypass: short-lived debounce timer; scheduleNotify path is guarded by typeof check downstream
     scrollIdleTimer = setTimeout(function() {
       scrollIdleTimer = null
       scheduleNotify("scroll_idle", "mutation", "flat")
@@ -567,9 +575,11 @@ export function startWatching(opts) {
   if (tracker) {
     tracker.addListener(cid, window, "scroll", scrollHandler, { passive: true })
   } else {
+    // tracker-bypass: __resources install failed — fallback is best-effort
     window.addEventListener("scroll", scrollHandler, { passive: true })
   }
 
+  // tracker-bypass: observer instance only; registered via tracker.addObserver below
   var observer = new MutationObserver(function(mutations) {
     var hasTweet = false
     for (var i = 0; i < mutations.length; i++) {
@@ -590,7 +600,6 @@ export function startWatching(opts) {
 
   if (tracker) {
     tracker.addObserver(cid, observer, document.body, { childList: true, subtree: true })
-    tracker.addCleanup(cid, function() { window[opts.watchingFlag] = false })
   } else {
     observer.observe(document.body, { childList: true, subtree: true })
   }

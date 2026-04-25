@@ -23,23 +23,41 @@
  * and arbitrary cleanup functions keyed by collector ID. Calling
  * disposeCollector(id) tears down everything registered under that ID.
  *
+ * Disposal order per bucket: MutationObservers disconnect FIRST, then other
+ * cleanups run LIFO. This prevents a cleanup that mutates the DOM from being
+ * picked up by a still-live observer that then tries to notify against a
+ * closed CDP binding.
+ *
+ * Cleanup purity rule — cleanup callbacks registered via addCleanup MUST:
+ *   (a) not call window.__latentInfoNotify or any CDP-dependent API — during
+ *       reattach, the old CDP session is gone and such calls throw; and
+ *   (b) not perform DOM mutations observable by any still-live MutationObserver
+ *       in the same or prior lifetime.
+ *
  * Uses AbortController for addEventListener cleanup (native browser support).
  */
 export function createResourceTracker() {
-  var resources = {}
+  var resources = {}  // { [collectorId]: Array<() => void> } — non-observer cleanups, LIFO
+  var observers = {}  // { [collectorId]: Array<() => void> } — observer.disconnect fns, disposed first
 
   function getOrCreate(collectorId) {
     if (!resources[collectorId]) resources[collectorId] = []
     return resources[collectorId]
   }
 
+  function getOrCreateObservers(collectorId) {
+    if (!observers[collectorId]) observers[collectorId] = []
+    return observers[collectorId]
+  }
+
   return {
     /**
-     * Track a MutationObserver. Calls observe() and stores disconnect().
+     * Track a MutationObserver. Calls observe() and stores disconnect() in
+     * the observers bucket so it runs before any other cleanup on dispose.
      */
     addObserver: function(collectorId, observer, target, config) {
       observer.observe(target, config)
-      getOrCreate(collectorId).push(function() { observer.disconnect() })
+      getOrCreateObservers(collectorId).push(function() { observer.disconnect() })
       return observer
     },
 
@@ -79,30 +97,46 @@ export function createResourceTracker() {
 
     /**
      * Register an arbitrary cleanup function.
+     * See purity rule in the module header — no __latentInfoNotify, no DOM
+     * mutations observable by still-live MutationObservers.
      */
     addCleanup: function(collectorId, fn) {
       getOrCreate(collectorId).push(fn)
     },
 
     /**
-     * Tear down all resources for a specific collector (LIFO order).
+     * Tear down all resources for a specific collector.
+     * Observers disconnect first, then other cleanups run LIFO.
      */
     disposeCollector: function(collectorId) {
-      var cleanups = resources[collectorId]
-      if (!cleanups) return
-      for (var i = cleanups.length - 1; i >= 0; i--) {
-        try { cleanups[i]() } catch(e) { /* swallow — continue cleanup */ }
+      var obs = observers[collectorId]
+      if (obs) {
+        for (var k = obs.length - 1; k >= 0; k--) {
+          try { obs[k]() } catch(e) { /* swallow — continue cleanup */ }
+        }
+        delete observers[collectorId]
       }
-      delete resources[collectorId]
+      var cleanups = resources[collectorId]
+      if (cleanups) {
+        for (var i = cleanups.length - 1; i >= 0; i--) {
+          try { cleanups[i]() } catch(e) { /* swallow — continue cleanup */ }
+        }
+        delete resources[collectorId]
+      }
     },
 
     /**
      * Tear down all resources for all collectors.
      */
     disposeAll: function() {
-      var ids = Object.keys(resources)
-      for (var j = 0; j < ids.length; j++) {
-        this.disposeCollector(ids[j])
+      var ids = {}
+      var rk = Object.keys(resources)
+      for (var j = 0; j < rk.length; j++) ids[rk[j]] = true
+      var ok = Object.keys(observers)
+      for (var m = 0; m < ok.length; m++) ids[ok[m]] = true
+      var allIds = Object.keys(ids)
+      for (var n = 0; n < allIds.length; n++) {
+        this.disposeCollector(allIds[n])
       }
     },
 
@@ -110,7 +144,12 @@ export function createResourceTracker() {
      * Query which collectors have registered resources.
      */
     activeCollectors: function() {
-      return Object.keys(resources)
+      var ids = {}
+      var rk = Object.keys(resources)
+      for (var j = 0; j < rk.length; j++) ids[rk[j]] = true
+      var ok = Object.keys(observers)
+      for (var m = 0; m < ok.length; m++) ids[ok[m]] = true
+      return Object.keys(ids)
     }
   }
 }

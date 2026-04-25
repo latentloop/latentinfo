@@ -31,7 +31,6 @@ const log = createLogger("x")
 
 const MODULE_NAME = "li_x"
 const NOTIFY_KEY = "li_x:new_tweets"
-const WATCHING_FLAG = "__latent_info_x_watching"
 
 // ---------------------------------------------------------------------------
 // Types for data returned from page-side functions
@@ -610,7 +609,6 @@ export function createPageHandler(page: PageProxy, db: Client): void {
       await page.callModule(MODULE_NAME, "startWatching", {
         appName: MODULE_NAME,
         notifyKey: NOTIFY_KEY,
-        watchingFlag: WATCHING_FLAG,
         collectorId: "x",
       })
 
