@@ -29,6 +29,8 @@ import * as panelFns from "./page-panel.js"
 import * as resourceFns from "./page-resources.js"
 
 const log = createLogger("runner")
+const ACTIVATION_NOTIFY_KEY = "__latent:page-activation"
+const LOCATION_CHECK_DEDUPE_MS = 1000
 
 /** Check if an error is a stale CDP session (tab closed / navigated away). */
 function isStaleSessionError(e: unknown): boolean {
@@ -49,6 +51,11 @@ export type CollectorDefinition = {
   pageHandler?: (page: PageProxy, db: Client) => void
   /** Action handler — injects panel UI + page-side logic. Fire-and-forget (async IIFE internally). */
   actionHandler?: (page: PageProxy, db: Client) => void
+}
+
+export type ActiveTabHint = {
+  url: string
+  title?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -283,8 +290,16 @@ interface RunnerState {
   conn: CdpConnection
   /** targetId -> set of collector IDs that have been injected */
   injectedTargets: Map<string, Set<string>>
+  /** targetIds that have the lightweight activation probe installed. */
+  probedTargets: Set<string>
   /** targetId -> latest URL seen while the target was already being processed */
   pendingTargetUrls: Map<string, string>
+  /** targetId -> latest pending heavy collector check reason while a check is active */
+  pendingCollectorChecks: Map<string, CollectorCheckReason>
+  /** targetIds currently running checkAndRunCollectors */
+  checkingTargets: Set<string>
+  /** targetId -> most recent URL-based full collector check */
+  recentLocationChecks: Map<string, { url: string; at: number }>
   cleanups: (() => void)[]
   active: boolean
   /** True once cdpHandlers have finished — page handlers must wait for this. */
@@ -313,6 +328,20 @@ type PageReadinessSnapshot = {
   locationHref: string
 }
 
+type PageActivationSnapshot = PageReadinessSnapshot & {
+  visibilityState: string
+  hasFocus: boolean
+}
+
+type TargetAttachReason = "initial" | "initial-active" | "created" | "location-change" | "config-enable"
+type CollectorCheckReason = "initial-visible" | "activation" | "location-change" | "frame-navigation" | "config-enable"
+
+type ActivationNotifySignal = {
+  key: typeof ACTIVATION_NOTIFY_KEY
+  reason: string
+  detectedAt: number
+}
+
 function isPageReadyForCollectors(value: unknown): value is PageReadinessSnapshot {
   if (!value || typeof value !== "object") return false
   const snapshot = value as Record<string, unknown>
@@ -321,6 +350,43 @@ function isPageReadyForCollectors(value: unknown): value is PageReadinessSnapsho
     snapshot.readyState !== "loading" &&
     typeof snapshot.locationHref === "string" &&
     snapshot.locationHref.startsWith("http")
+}
+
+function isPageActiveForCollectors(value: unknown): value is PageActivationSnapshot {
+  if (!isPageReadyForCollectors(value)) return false
+  const snapshot = value as Record<string, unknown>
+  return typeof snapshot.visibilityState === "string" &&
+    typeof snapshot.hasFocus === "boolean" &&
+    (snapshot.visibilityState === "visible" || snapshot.hasFocus === true)
+}
+
+function shouldRunCollectorsAfterAttach(reason: TargetAttachReason, snapshot: unknown): boolean {
+  if (!isPageReadyForCollectors(snapshot)) return false
+  if (reason === "location-change" || reason === "initial-active" || reason === "config-enable") return true
+  return isPageActiveForCollectors(snapshot)
+}
+
+function parseActivationNotifyPayload(payload: unknown): ActivationNotifySignal | null {
+  if (typeof payload !== "string") return null
+  try {
+    const parsed = JSON.parse(payload) as Record<string, unknown>
+    if (parsed.key !== ACTIVATION_NOTIFY_KEY) return null
+    return {
+      key: ACTIVATION_NOTIFY_KEY,
+      reason: typeof parsed.reason === "string" ? parsed.reason : "unknown",
+      detectedAt: typeof parsed.detectedAt === "number" ? parsed.detectedAt : Date.now(),
+    }
+  } catch {
+    return null
+  }
+}
+
+function isDuplicateLocationCheck(
+  previous: { url: string; at: number } | undefined,
+  nextUrl: string,
+  now: number,
+): boolean {
+  return Boolean(previous && previous.url === nextUrl && now - previous.at < LOCATION_CHECK_DEDUPE_MS)
 }
 
 function decideTargetInfoChange(
@@ -361,6 +427,54 @@ function findMatchingCollectors(url: string, collectors: CollectorDefinition[]):
   return collectors.filter((c) => matchesUrlPattern(url, c.urlPatterns))
 }
 
+function hasEnabledMatchingCollectors(url: string, collectors: CollectorDefinition[]): boolean {
+  return findMatchingCollectors(url, collectors).some((c) => loadCollectorConfig(c.id).enabled !== false)
+}
+
+function hasCompleteCollectorInjection(injectedSet: Set<string> | undefined, collector: CollectorDefinition): boolean {
+  if (!injectedSet?.has(collector.id)) return false
+  return !collector.actionHandler || injectedSet.has(collector.id + ":action")
+}
+
+type TargetInfo = {
+  targetId: string
+  type: string
+  url: string
+  title?: string
+}
+
+function urlsMatchActiveHint(targetUrl: string, hintUrl: string): boolean {
+  if (targetUrl === hintUrl) return true
+  try {
+    const target = new URL(targetUrl)
+    const hint = new URL(hintUrl)
+    target.hash = ""
+    hint.hash = ""
+    return target.toString() === hint.toString()
+  } catch {
+    return false
+  }
+}
+
+function targetMatchesActiveHint(target: TargetInfo, activeTabHint: ActiveTabHint | undefined): boolean {
+  if (!activeTabHint?.url.startsWith("http")) return false
+  if (!target.url.startsWith("http")) return false
+  return urlsMatchActiveHint(target.url, activeTabHint.url)
+}
+
+function orderPageTargetsForInitialAttach(
+  pageTargets: TargetInfo[],
+  activeTabHint: ActiveTabHint | undefined,
+): { active: TargetInfo[]; rest: TargetInfo[] } {
+  const active: TargetInfo[] = []
+  const rest: TargetInfo[] = []
+  for (const target of pageTargets) {
+    if (targetMatchesActiveHint(target, activeTabHint)) active.push(target)
+    else rest.push(target)
+  }
+  return { active, rest }
+}
+
 // ---------------------------------------------------------------------------
 // Start / Stop
 // ---------------------------------------------------------------------------
@@ -369,6 +483,7 @@ export async function startCollectorRunner(
   sessionName: string,
   collectors: CollectorDefinition[],
   db: Client,
+  activeTabHint?: ActiveTabHint,
 ): Promise<void> {
   stopCollectorRunner(sessionName)
 
@@ -379,7 +494,11 @@ export async function startCollectorRunner(
     sessionName,
     conn: session.conn,
     injectedTargets: new Map(),
+    probedTargets: new Set(),
     pendingTargetUrls: new Map(),
+    pendingCollectorChecks: new Map(),
+    checkingTargets: new Set(),
+    recentLocationChecks: new Map(),
     cleanups: [],
     active: true,
     cdpReady: false,
@@ -396,8 +515,11 @@ export async function startCollectorRunner(
     const info = params.targetInfo as { targetId: string; type: string; url: string }
     if (info.type !== "page") return
     if (!info.url.startsWith("http")) return
+    if (!hasEnabledMatchingCollectors(info.url, collectors)) return
     log.debug(`${ts()} EVENT targetCreated: ${info.url.slice(0, 60)}`)
-    handleNewTarget(state, info.targetId, info.url, collectors, db)
+    handleNewTarget(state, info.targetId, info.url, collectors, db, "created").catch((e) => {
+      if (!isStaleSessionError(e)) log.error(e, "handleNewTarget error")
+    })
   })
   state.cleanups.push(unsubCreated)
 
@@ -424,8 +546,10 @@ export async function startCollectorRunner(
       case "clear":
         log.debug(`${ts()} EVENT targetInfoChanged (clear): ${info.url.slice(0, 60)}`)
         state.injectedTargets.delete(info.targetId)
+        state.probedTargets.delete(info.targetId)
         clearNotifyHandlers(info.targetId)
         state.pendingTargetUrls.delete(info.targetId)
+        state.recentLocationChecks.delete(info.targetId)
         return
       case "queue-check":
       case "queue-attach":
@@ -438,13 +562,12 @@ export async function startCollectorRunner(
         log.debug(`${ts()} EVENT targetInfoChanged: ${info.url.slice(0, 60)}`)
         state.injectedTargets.delete(info.targetId)
         clearNotifyHandlers(info.targetId)
-        checkAndRunCollectors(state, target!, collectors, db).catch((e) => {
-          if (!isStaleSessionError(e)) log.error(e, "checkAndRunCollectors error")
-        })
+        scheduleCollectorCheck(state, target!, collectors, db, "location-change")
         return
       case "attach-now":
+        if (!hasEnabledMatchingCollectors(info.url, collectors)) return
         log.debug(`${ts()} EVENT targetInfoChanged (new): ${info.url.slice(0, 60)}`)
-        handleNewTarget(state, info.targetId, info.url, collectors, db).catch((e) => {
+        handleNewTarget(state, info.targetId, info.url, collectors, db, "location-change").catch((e) => {
           if (!isStaleSessionError(e)) log.error(e, "handleNewTarget error")
         })
         return
@@ -456,7 +579,12 @@ export async function startCollectorRunner(
   const unsubDestroyed = onEvent(conn, "Target.targetDestroyed", (params) => {
     const targetId = params.targetId as string
     state.injectedTargets.delete(targetId)
+    state.probedTargets.delete(targetId)
     clearNotifyHandlers(targetId)
+    state.pendingTargetUrls.delete(targetId)
+    state.pendingCollectorChecks.delete(targetId)
+    state.checkingTargets.delete(targetId)
+    state.recentLocationChecks.delete(targetId)
     removeTarget(session, targetId)
   })
   state.cleanups.push(unsubDestroyed)
@@ -469,6 +597,13 @@ export async function startCollectorRunner(
     // Find target by session ID and forward notification
     for (const target of session.targets.values()) {
       if (target.sessionId === eventSid) {
+        const activation = parseActivationNotifyPayload(params.payload)
+        if (activation) {
+          handleActivationNotification(state, target, collectors, db).catch((e) => {
+            if (!isStaleSessionError(e)) log.error(e, "activation notification error")
+          })
+          return
+        }
         dispatchNotify(target.targetId, params.payload as string)
         break
       }
@@ -490,11 +625,11 @@ export async function startCollectorRunner(
       if (target.sessionId === eventSid) {
         log.debug(`${ts()} EVENT frameNavigated: ${frame.url.slice(0, 60)}`)
         state.injectedTargets.delete(target.targetId)
+        state.probedTargets.delete(target.targetId)
         clearNotifyHandlers(target.targetId)
+        state.recentLocationChecks.delete(target.targetId)
         target.url = frame.url
-        checkAndRunCollectors(state, target, collectors, db).catch((e) => {
-          if (!isStaleSessionError(e)) log.error(e, "checkAndRunCollectors error")
-        })
+        scheduleCollectorCheck(state, target, collectors, db, "frame-navigation")
         break
       }
     }
@@ -510,13 +645,23 @@ export async function startCollectorRunner(
 
   // 4. Attach to existing http page targets — in parallel
   const result = await sendCommand(conn, "Target.getTargets") as {
-    targetInfos: { targetId: string; type: string; url: string }[]
+    targetInfos: TargetInfo[]
   }
   const pageTargets = result.targetInfos.filter(
-    (t) => t.type === "page" && t.url.startsWith("http"),
+    (t) => t.type === "page" && t.url.startsWith("http") && hasEnabledMatchingCollectors(t.url, collectors),
   )
+  const orderedTargets = orderPageTargetsForInitialAttach(pageTargets, activeTabHint)
+  if (activeTabHint?.url) {
+    log.debug({
+      activeTabUrl: activeTabHint.url,
+      matchedTargets: orderedTargets.active.length,
+    }, "Initial active-tab hint")
+  }
+  for (const info of orderedTargets.active) {
+    await handleNewTarget(state, info.targetId, info.url, collectors, db, "initial-active")
+  }
   await Promise.all(
-    pageTargets.map((info) => handleNewTarget(state, info.targetId, info.url, collectors, db)),
+    orderedTargets.rest.map((info) => handleNewTarget(state, info.targetId, info.url, collectors, db, "initial")),
   )
 
   // 5. Listen for collector config changes (enable/disable toggle)
@@ -548,16 +693,30 @@ export async function startCollectorRunner(
       log.info({ collectorId }, "Collector enabled, re-injecting on matching targets")
       const def = collectors.find((c) => c.id === collectorId)
       if (!def) return
-      for (const [targetId] of state.injectedTargets) {
-        const target = session.targets.get(targetId)
-        if (!target) continue
+      const knownTargets = new Set<string>()
+      for (const target of session.targets.values()) {
+        knownTargets.add(target.targetId)
+        if (!target.url.startsWith("http")) continue
         if (!matchesUrlPattern(target.url, def.urlPatterns)) continue
-        const injectedSet = state.injectedTargets.get(targetId)
-        if (injectedSet?.has(collectorId)) continue // already injected
-        checkAndRunCollectors(state, target, collectors, db).catch((e) => {
-          if (!isStaleSessionError(e)) log.error(e, "Re-injection error")
-        })
+        const injectedSet = state.injectedTargets.get(target.targetId)
+        if (hasCompleteCollectorInjection(injectedSet, def)) continue
+        scheduleCollectorCheck(state, target, collectors, db, "config-enable")
       }
+      sendCommand(state.conn, "Target.getTargets")
+        .then((result) => {
+          const targets = (result as { targetInfos?: TargetInfo[] }).targetInfos ?? []
+          for (const target of targets) {
+            if (knownTargets.has(target.targetId)) continue
+            if (target.type !== "page" || !target.url.startsWith("http")) continue
+            if (!matchesUrlPattern(target.url, def.urlPatterns)) continue
+            handleNewTarget(state, target.targetId, target.url, collectors, db, "config-enable").catch((e) => {
+              if (!isStaleSessionError(e)) log.error(e, "handleNewTarget config-enable error")
+            })
+          }
+        })
+        .catch((e) => {
+          if (!isStaleSessionError(e)) log.error(e, "Target.getTargets config-enable error")
+        })
     }
   }
   onCollectorConfigChanged(configHandler)
@@ -585,7 +744,11 @@ export function stopCollectorRunner(sessionName: string): void {
     }
   }
   state.injectedTargets.clear()
+  state.probedTargets.clear()
   state.pendingTargetUrls.clear()
+  state.pendingCollectorChecks.clear()
+  state.checkingTargets.clear()
+  state.recentLocationChecks.clear()
   runners.delete(sessionName)
   log.info(`Collector runner stopped for session: ${sessionName}`)
 }
@@ -594,17 +757,159 @@ export function stopCollectorRunner(sessionName: string): void {
 // Target handling
 // ---------------------------------------------------------------------------
 
+async function readPageActivationSnapshot(
+  state: RunnerState,
+  target: PageTarget,
+  timeoutMs = 3000,
+): Promise<PageActivationSnapshot | null> {
+  try {
+    const r = await sendCommand(state.conn, "Runtime.evaluate", {
+      expression: `({
+        hasBody: !!document.body,
+        readyState: document.readyState,
+        locationHref: location.href,
+        visibilityState: document.visibilityState || "",
+        hasFocus: document.hasFocus()
+      })`,
+      returnByValue: true,
+    }, target.sessionId, timeoutMs) as { result: { value: unknown } }
+    return isPageActiveForCollectors(r.result.value) ? r.result.value : null
+  } catch {
+    return null
+  }
+}
+
+async function handleActivationNotification(
+  state: RunnerState,
+  target: PageTarget,
+  collectors: CollectorDefinition[],
+  db: Client,
+): Promise<void> {
+  const snapshot = await readPageActivationSnapshot(state, target)
+  if (!snapshot) return
+  target.url = snapshot.locationHref
+  scheduleCollectorCheck(state, target, collectors, db, "activation")
+}
+
+async function installActivationProbe(state: RunnerState, target: PageTarget): Promise<void> {
+  if (state.probedTargets.has(target.targetId)) return
+  const proxy = createPageProxy(state.conn, target)
+  await proxy.evaluate(`(function() {
+    window.__latent = window.__latent || {};
+    window.__latent.__activationProbeActive = true;
+    if (window.__latent.__activationProbeInstalled) return;
+    window.__latent.__activationProbeInstalled = true;
+    var notifyKey = ${JSON.stringify(ACTIVATION_NOTIFY_KEY)};
+    var notifyBindingName = ${JSON.stringify(NOTIFY_BINDING_NAME)};
+    function notify(reason) {
+      try {
+        if (!window.__latent || window.__latent.__activationProbeActive !== true) return;
+        if (typeof window[notifyBindingName] !== "function") return;
+        var hasFocus = false;
+        try { hasFocus = document.hasFocus(); } catch (e) {}
+        var visibilityState = document.visibilityState || "";
+        if (visibilityState !== "visible" && !hasFocus) return;
+        window[notifyBindingName](JSON.stringify({
+          key: notifyKey,
+          reason: reason || "unknown",
+          href: location.href,
+          hasBody: !!document.body,
+          readyState: document.readyState,
+          visibilityState: visibilityState,
+          hasFocus: hasFocus,
+          detectedAt: Date.now()
+        }));
+      } catch (e) {}
+    }
+    document.addEventListener("visibilitychange", function() { notify("visibilitychange"); }, true);
+    window.addEventListener("focus", function() { notify("focus"); }, true);
+    window.addEventListener("pageshow", function() { notify("pageshow"); }, true);
+  })()`)
+  state.probedTargets.add(target.targetId)
+}
+
+async function deactivateActivationProbe(state: RunnerState, target: PageTarget): Promise<void> {
+  if (!state.probedTargets.delete(target.targetId)) return
+  const proxy = createPageProxy(state.conn, target)
+  try {
+    await proxy.evaluate(`if (window.__latent) window.__latent.__activationProbeActive = false`)
+  } catch (e) {
+    if (!isStaleSessionError(e)) log.debug(e, "activation probe deactivate skipped")
+  }
+}
+
+function scheduleCollectorCheck(
+  state: RunnerState,
+  target: PageTarget,
+  collectors: CollectorDefinition[],
+  db: Client,
+  reason: CollectorCheckReason,
+): void {
+  runCollectorCheck(state, target, collectors, db, reason).catch((e) => {
+    if (!isStaleSessionError(e)) log.error(e, "checkAndRunCollectors error")
+  })
+}
+
+async function runCollectorCheck(
+  state: RunnerState,
+  target: PageTarget,
+  collectors: CollectorDefinition[],
+  db: Client,
+  reason: CollectorCheckReason,
+): Promise<void> {
+  if (!state.active) return
+  if (!target.url.startsWith("http")) return
+
+  if (state.checkingTargets.has(target.targetId)) {
+    state.pendingCollectorChecks.set(target.targetId, reason)
+    return
+  }
+
+  const recordsLocationCheck = reason === "location-change" || reason === "frame-navigation"
+  if (reason === "location-change") {
+    const now = Date.now()
+    const previous = state.recentLocationChecks.get(target.targetId)
+    if (isDuplicateLocationCheck(previous, target.url, now)) return
+  }
+
+  state.checkingTargets.add(target.targetId)
+  let completed = false
+  try {
+    log.debug(`${ts()} collector check (${reason}): ${target.url.slice(0, 60)}`)
+    await checkAndRunCollectors(state, target, collectors, db)
+    await deactivateActivationProbe(state, target)
+    completed = true
+  } finally {
+    if (completed && recordsLocationCheck) {
+      state.recentLocationChecks.set(target.targetId, { url: target.url, at: Date.now() })
+    }
+    state.checkingTargets.delete(target.targetId)
+
+    const pendingReason = state.pendingCollectorChecks.get(target.targetId)
+    if (!pendingReason || !state.active) return
+    state.pendingCollectorChecks.delete(target.targetId)
+
+    const session = getSession(state.sessionName)
+    const latestTarget = session?.targets.get(target.targetId)
+    if (latestTarget) {
+      await runCollectorCheck(state, latestTarget, collectors, db, pendingReason)
+    }
+  }
+}
+
 async function handleNewTarget(
   state: RunnerState,
   targetId: string,
   url: string,
   collectors: CollectorDefinition[],
   db: Client,
+  reason: TargetAttachReason,
 ): Promise<void> {
   // Skip until cdpHandlers have finished
   if (!state.cdpReady) return
-  // Skip if already injected or currently being processed
-  if (state.injectedTargets.has(targetId)) return
+  if (!hasEnabledMatchingCollectors(url, collectors)) return
+  // Skip if this target already has the lightweight probe and this is not a navigation.
+  if (reason !== "location-change" && state.probedTargets.has(targetId)) return
   if (processingTargets.has(targetId)) return
   processingTargets.add(targetId)
 
@@ -618,19 +923,23 @@ async function handleNewTarget(
     log.debug(`${ts()} handleNewTarget: attached, waiting for page readiness`)
 
     let pageReady = false
+    let snapshot: PageActivationSnapshot | PageReadinessSnapshot | null = null
     for (let i = 0; i < 10; i++) {
       try {
         const r = await sendCommand(state.conn, "Runtime.evaluate", {
           expression: `({
             hasBody: !!document.body,
             readyState: document.readyState,
-            locationHref: location.href
+            locationHref: location.href,
+            visibilityState: document.visibilityState || "",
+            hasFocus: document.hasFocus()
           })`,
           returnByValue: true,
         }, target.sessionId, 3000) as { result: { value: unknown } }
         if (isPageReadyForCollectors(r.result.value)) {
           pageReady = true
-          target.url = r.result.value.locationHref
+          snapshot = r.result.value
+          target.url = snapshot.locationHref
           break
         }
       } catch { /* page not ready */ }
@@ -643,9 +952,20 @@ async function handleNewTarget(
       })
     }
     if (!pageReady) { log.debug(`${ts()} handleNewTarget: page never became ready, skipping`); return }
-    log.debug(`${ts()} handleNewTarget: page ready, running collectors`)
+    if (!shouldRunCollectorsAfterAttach(reason, snapshot)) {
+      if (hasEnabledMatchingCollectors(target.url, collectors)) {
+        await installActivationProbe(state, target)
+      }
+      log.debug(`${ts()} handleNewTarget: page ready but inactive, deferring collectors`)
+      return
+    }
+    const checkReason: CollectorCheckReason =
+      reason === "location-change" ? "location-change" :
+      reason === "config-enable" ? "config-enable" :
+      "initial-visible"
+    log.debug(`${ts()} handleNewTarget: page ready, scheduling collectors (${checkReason})`)
 
-    await checkAndRunCollectors(state, target, collectors, db)
+    await runCollectorCheck(state, target, collectors, db, checkReason)
     log.debug(`${ts()} handleNewTarget: done`)
   } finally {
     processingTargets.delete(targetId)
@@ -662,17 +982,23 @@ async function handleNewTarget(
       pendingTarget.url = pendingUrl
       if (!pendingUrl.startsWith("http")) {
         state.injectedTargets.delete(targetId)
+        state.probedTargets.delete(targetId)
         clearNotifyHandlers(targetId)
         return
       }
-      checkAndRunCollectors(state, pendingTarget, collectors, db).catch((e) => {
-        if (!isStaleSessionError(e)) log.error(e, "checkAndRunCollectors error")
-      })
+      if (!hasEnabledMatchingCollectors(pendingUrl, collectors)) {
+        state.injectedTargets.delete(targetId)
+        state.probedTargets.delete(targetId)
+        clearNotifyHandlers(targetId)
+        return
+      }
+      scheduleCollectorCheck(state, pendingTarget, collectors, db, "location-change")
       return
     }
 
     if (!pendingUrl.startsWith("http")) return
-    handleNewTarget(state, targetId, pendingUrl, collectors, db).catch((e) => {
+    if (!hasEnabledMatchingCollectors(pendingUrl, collectors)) return
+    handleNewTarget(state, targetId, pendingUrl, collectors, db, "location-change").catch((e) => {
       if (!isStaleSessionError(e)) log.error(e, "handleNewTarget error")
     })
   }
@@ -828,14 +1154,38 @@ async function runCdpHandlers(
 // Info
 // ---------------------------------------------------------------------------
 
-export function getRunnerInfo(): { sessionName: string; pageCount: number }[] {
-  return Array.from(runners.entries()).map(([name, state]) => ({
-    sessionName: name,
-    pageCount: state.injectedTargets.size,
-  }))
+export function getRunnerInfo(): {
+  sessionName: string
+  pageCount: number
+  attachedPageCount: number
+  probedPageCount: number
+  injectedPageCount: number
+  deferredPageCount: number
+}[] {
+  return Array.from(runners.entries()).map(([name, state]) => {
+    const session = getSession(name)
+    const attachedPageCount = session?.targets.size ?? state.injectedTargets.size
+    const injectedPageCount = state.injectedTargets.size
+    const deferredPageCount = Array.from(state.probedTargets).filter((targetId) => !state.injectedTargets.has(targetId)).length
+    return {
+      sessionName: name,
+      pageCount: attachedPageCount,
+      attachedPageCount,
+      probedPageCount: state.probedTargets.size,
+      injectedPageCount,
+      deferredPageCount,
+    }
+  })
 }
 
 export const __test__ = {
   decideTargetInfoChange,
+  hasCompleteCollectorInjection,
+  hasEnabledMatchingCollectors,
   isPageReadyForCollectors,
+  isPageActiveForCollectors,
+  orderPageTargetsForInitialAttach,
+  shouldRunCollectorsAfterAttach,
+  parseActivationNotifyPayload,
+  isDuplicateLocationCheck,
 }

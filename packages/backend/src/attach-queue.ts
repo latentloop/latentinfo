@@ -11,7 +11,7 @@
 import type { Client } from "@libsql/client"
 import { execFileSync } from "node:child_process"
 import { attach, detach, isAttached, isAttaching, getAttachedSessions } from "./cdp.js"
-import { startCollectorRunner, stopCollectorRunner, type CollectorDefinition } from "./collector-runner.js"
+import { startCollectorRunner, stopCollectorRunner, type ActiveTabHint, type CollectorDefinition } from "./collector-runner.js"
 import { isBrowserFrontmost, refreshSessions } from "./browser-monitor.js"
 import { getSessionManualActions, recordSessionManualAction, type BrowserSession } from "./state.js"
 import type { BrowserEntry } from "./settings.js"
@@ -51,9 +51,50 @@ const lastDetachTime = new Map<string, number>()
 /** Debounce window: if a session was detached less than this many ms ago, delay re-attach. */
 const REATTACH_DEBOUNCE_MS = 2000
 
+const BROWSER_SCRIPT_NAMES: Record<string, string> = {
+  "Google Chrome.app": "Google Chrome",
+  "Google Chrome Canary.app": "Google Chrome Canary",
+  "Google Chrome for Testing.app": "Google Chrome for Testing",
+}
+
 /** Get ms since the last attach attempt (for dialog timing logs). */
 export function getLastAttachStartMs(): number {
   return _lastAttachStartMs
+}
+
+function getBrowserScriptName(appPath: string): string {
+  const appBundleName = appPath.split("/").pop() ?? appPath
+  return BROWSER_SCRIPT_NAMES[appBundleName] ?? appBundleName.replace(/\.app$/, "")
+}
+
+function readActiveTabHint(appPath: string): ActiveTabHint | undefined {
+  const appName = getBrowserScriptName(appPath)
+  const script = `
+    const app = Application(${JSON.stringify(appName)});
+    if (!app.running() || app.windows.length === 0) {
+      "";
+    } else {
+      const tab = app.windows[0].activeTab;
+      JSON.stringify({ url: tab.url(), title: tab.title() });
+    }
+  `
+  try {
+    const raw = execFileSync("osascript", ["-l", "JavaScript", "-e", script], {
+      encoding: "utf-8",
+      timeout: 1000,
+    }).trim()
+    if (!raw) return undefined
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    return typeof parsed.url === "string" && parsed.url.startsWith("http")
+      ? {
+          url: parsed.url,
+          title: typeof parsed.title === "string" ? parsed.title : undefined,
+        }
+      : undefined
+  } catch (e) {
+    log.debug({ appName, error: e instanceof Error ? e.message : String(e) }, "Could not read active browser tab")
+    return undefined
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +166,8 @@ export async function requestManualAttach(sessionName: string, wsUrl: string): P
     _onSessionChange?.("session-attached", sessionName)
     log.info({ sessionName, attachMs }, "Manual attach succeeded")
     if (_db) {
-      await startCollectorRunner(sessionName, _collectors, _db)
+      const session = refreshSessions(_browsers).find((s) => s.sessionName === sessionName)
+      await startCollectorRunner(sessionName, _collectors, _db, session ? readActiveTabHint(session.appPath) : undefined)
     }
     _onSessionChange?.("session-ready", sessionName)
   } else {
@@ -235,7 +277,7 @@ async function processQueue(targetSessions?: ReadonlySet<string>): Promise<void>
           _onSessionChange?.("session-attached", sn)
           log.info({ sn, attachMs }, "Auto-attached successfully")
           if (_db) {
-            await startCollectorRunner(sn, _collectors, _db)
+            await startCollectorRunner(sn, _collectors, _db, readActiveTabHint(session.appPath))
           }
           _onSessionChange?.("session-ready", sn)
         } else {
