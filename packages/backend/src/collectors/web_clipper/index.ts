@@ -1,7 +1,7 @@
 /**
  * Web Clipper collector definition.
  *
- * Matches all pages (urlPatterns: ["*"]).
+ * Currently scoped to X pages while collector injection is gated by URL rules.
  * - actionHandler: clip button in panel → selection UI → store in SQLite
  * - pageHandler: auto-detect rules (x_article, etc.)
  */
@@ -15,7 +15,7 @@ const webClipperCollector: CollectorDefinition = {
   description: "Clip web content for reading",
 
   urlPatterns: [
-    "*",
+    "https://x.com/*",
   ],
 
   actionHandler(page, db) {
@@ -25,6 +25,8 @@ const webClipperCollector: CollectorDefinition = {
   pageHandler(page, _db) {
     createPageHandler(page)
   },
+
+  rerunPageHandlerOnUrlChange: true,
 }
 
 export default webClipperCollector

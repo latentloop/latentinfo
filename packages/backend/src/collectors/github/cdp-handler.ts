@@ -12,7 +12,7 @@ import type { GithubDocument, GithubReadmeImage } from "./types.js"
 import { fetchCachedImages } from "../media-cache.js"
 import { extractReadme, addBadge } from "./page-functions.js"
 import { createLogger } from "../../logger.js"
-import { broadcastSseEvent } from "../../server.js"
+import { emitBackendEvent } from "../../events.js"
 
 const log = createLogger("github")
 const MODULE_NAME = "li_github"
@@ -38,10 +38,7 @@ interface RawGithubReadme {
 }
 
 interface ExistingGithubDoc {
-  collectedAt: string
-  readmeSha: string
-  readmeMarkdown: string
-  readmeImagesCount: number
+  doc: GithubDocument
 }
 
 interface ReadmeImageCandidate {
@@ -130,6 +127,38 @@ function collectReadmeImageCandidates(raw: RawGithubReadme): ReadmeImageCandidat
   return candidates.slice(0, MAX_README_IMAGES)
 }
 
+function parseStoredDoc(raw: unknown): GithubDocument | null {
+  if (!raw) return null
+  try {
+    return typeof raw === "string"
+      ? JSON.parse(raw) as GithubDocument
+      : raw as GithubDocument
+  } catch {
+    return null
+  }
+}
+
+function isSameReadme(existing: GithubDocument, raw: RawGithubReadme): boolean {
+  if (existing.readmeSha && raw.readmeSha) return existing.readmeSha === raw.readmeSha
+  return existing.readmeMarkdown === raw.readmeMarkdown
+}
+
+function hasGithubInfoChanged(existing: GithubDocument, raw: RawGithubReadme): boolean {
+  if (!isSameReadme(existing, raw)) return true
+  return existing.owner !== raw.owner ||
+    existing.repo !== raw.repo ||
+    existing.fullName !== raw.fullName ||
+    existing.description !== raw.description ||
+    existing.defaultBranch !== raw.defaultBranch ||
+    existing.stars !== raw.stars ||
+    existing.forks !== raw.forks ||
+    existing.language !== raw.language ||
+    existing.readmePath !== raw.readmePath ||
+    existing.htmlUrl !== raw.htmlUrl ||
+    existing.rawUrl !== raw.rawUrl ||
+    existing.url !== raw.url
+}
+
 async function collectReadmeImages(
   page: PageProxy,
   candidates: ReadmeImageCandidate[],
@@ -155,31 +184,16 @@ async function collectReadmeImages(
   }
 }
 
-function countReadmeImages(rawImages: unknown): number {
-  if (Array.isArray(rawImages)) return rawImages.length
-  if (typeof rawImages !== "string" || !rawImages) return 0
-  try {
-    const parsed = JSON.parse(rawImages)
-    return Array.isArray(parsed) ? parsed.length : 0
-  } catch {
-    return 0
-  }
-}
-
 export function createPageHandler(page: PageProxy, db: Client): void {
   async function findExistingDoc(docId: string): Promise<ExistingGithubDoc | null> {
     try {
       const result = await db.execute({
-        sql: "SELECT json_extract(doc, '$.collectedAt') as ca, json_extract(doc, '$.readmeSha') as sha, json_extract(doc, '$.readmeMarkdown') as markdown, json_extract(doc, '$.readmeImages') as images FROM documents WHERE id = ? LIMIT 1",
+        sql: "SELECT doc FROM documents WHERE id = ? LIMIT 1",
         args: [docId],
       })
       if (result.rows.length === 0) return null
-      return {
-        collectedAt: (result.rows[0]!.ca as string) || "",
-        readmeSha: (result.rows[0]!.sha as string) || "",
-        readmeMarkdown: (result.rows[0]!.markdown as string) || "",
-        readmeImagesCount: countReadmeImages(result.rows[0]!.images),
-      }
+      const doc = parseStoredDoc(result.rows[0]!.doc)
+      return doc ? { doc } : null
     } catch {
       return null
     }
@@ -233,19 +247,17 @@ export function createPageHandler(page: PageProxy, db: Client): void {
 
       const docId = `github:${raw.fullName}`
       const existing = await findExistingDoc(docId)
-      const sameReadme = Boolean(existing &&
-        ((existing.readmeSha && existing.readmeSha === raw.readmeSha) ||
-          (!raw.readmeSha && existing.readmeMarkdown === raw.readmeMarkdown)))
-      const imageCandidates = collectReadmeImageCandidates(raw)
-      const needsImageBackfill = sameReadme && imageCandidates.length > 0 && existing!.readmeImagesCount === 0
 
-      if (existing && sameReadme && !needsImageBackfill) {
-        await page.callModule(MODULE_NAME, "addBadge", { isNew: false, collectedAt: existing.collectedAt })
+      if (existing && !hasGithubInfoChanged(existing.doc, raw)) {
+        await page.callModule(MODULE_NAME, "addBadge", { isNew: false, collectedAt: existing.doc.collectedAt })
         log.debug(`README ${raw.fullName} already collected`)
         return
       }
 
-      const readmeImages = await collectReadmeImages(page, imageCandidates)
+      const sameReadme = Boolean(existing && isSameReadme(existing.doc, raw))
+      const readmeImages = sameReadme
+        ? existing!.doc.readmeImages ?? []
+        : await collectReadmeImages(page, collectReadmeImageCandidates(raw))
       const doc: GithubDocument = {
         type: "github",
         owner: raw.owner,
@@ -264,18 +276,23 @@ export function createPageHandler(page: PageProxy, db: Client): void {
         htmlUrl: raw.htmlUrl,
         rawUrl: raw.rawUrl,
         url: raw.url,
-        collectedAt: existing && sameReadme ? existing.collectedAt : new Date().toISOString(),
+        collectedAt: new Date().toISOString(),
         collectedBy: "github",
       }
 
       const ok = await upsertDocument(docId, doc)
       if (ok) {
-        await page.callModule(MODULE_NAME, "addBadge", { isNew: !sameReadme, collectedAt: doc.collectedAt })
-        broadcastSseEvent("data-changed", { source: "github" })
-        log.info(`${sameReadme ? "Backfilled README images" : "Collected README"}: ${raw.fullName}`)
+        await page.callModule(MODULE_NAME, "addBadge", { isNew: !existing, collectedAt: doc.collectedAt })
+        emitBackendEvent("data-changed", { source: "github" })
+        log.info(`${existing ? "Updated" : "Collected"} README: ${raw.fullName}`)
       }
     } catch (e: unknown) {
       log.error(`GitHub collector scrape error: ${e instanceof Error ? e.message : e}`)
     }
   })()
+}
+
+export const __test__ = {
+  hasGithubInfoChanged,
+  isSameReadme,
 }

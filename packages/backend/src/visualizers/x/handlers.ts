@@ -9,7 +9,6 @@
  * - POST /tags/promote  → promote a backlog tag to confirmed
  */
 
-import type { IncomingMessage, ServerResponse } from "node:http"
 import { readFileSync, writeFileSync, statSync } from "node:fs"
 import { join } from "node:path"
 import type { Client } from "@libsql/client"
@@ -17,36 +16,13 @@ import { loadCache, getCacheError, searchEntries, filterByDateRange, filterByUse
 import type { XDocument, XItem, XListResponse, XSummaryResponse } from "./types.js"
 import { getProfileDir } from "../../config.js"
 import { createLogger } from "../../logger.js"
+import { emitBackendEvent } from "../../events.js"
+import { jsonResponse, readTextBody, type ApiRequest } from "../../server.js"
 
 const log = createLogger("x-handlers")
 
 // Cached tag registry — re-parsed only when prompt.md mtime changes
 let tagRegistryCache: { mtime: number; tags: string[]; backlogTags: string[] } | null = null
-
-const MAX_BODY_BYTES = 1024 * 1024
-
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = []
-    let size = 0
-    req.on("data", (chunk: Buffer) => {
-      size += chunk.length
-      if (size > MAX_BODY_BYTES) {
-        req.destroy()
-        reject(new Error("Request body too large"))
-        return
-      }
-      chunks.push(chunk)
-    })
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")))
-    req.on("error", reject)
-  })
-}
-
-function sendJson(res: ServerResponse, status: number, data: unknown): void {
-  res.writeHead(status, { "Content-Type": "application/json" })
-  res.end(JSON.stringify(data))
-}
 
 function parseXDoc(rowDoc: string | Record<string, unknown>): XDocument {
   return typeof rowDoc === "string"
@@ -83,13 +59,12 @@ async function hydrateFullPageItems(
 export async function handleXApi(
   path: string,
   query: URLSearchParams,
-  req: IncomingMessage,
-  res: ServerResponse,
+  request: ApiRequest,
   db: Client,
-): Promise<void> {
+): Promise<Response> {
   // Normalize path: ensure leading slash, remove trailing slash
   const normalizedPath = ("/" + path.replace(/^\/+/, "")).replace(/\/+$/, "") || "/"
-  const method = (req.method || "GET").toUpperCase()
+  const method = request.method.toUpperCase()
 
   // GET /summary → exact archive count. Kept separate so list/range requests
   // can stream pages without paying count cost on every request.
@@ -100,8 +75,7 @@ export async function handleXApi(
     const response: XSummaryResponse = {
       total: Number(result.rows[0]?.cnt ?? 0),
     }
-    sendJson(res, 200, response)
-    return
+    return jsonResponse(200, response)
   }
 
   // GET / → list posts
@@ -168,14 +142,12 @@ export async function handleXApi(
         limit,
         hasMore: pageResult.rows.length > limit,
       }
-      sendJson(res, 200, response)
-      return
+      return jsonResponse(200, response)
     }
 
     const cache = await loadCache(db)
     if (!cache) {
-      sendJson(res, 500, { error: getCacheError() || "DB not available" })
-      return
+      return jsonResponse(500, { error: getCacheError() || "DB not available" })
     }
 
     let indices = dateMode === "scrape_date" ? cache.byCollectedAt : cache.byPostDate
@@ -220,8 +192,7 @@ export async function handleXApi(
       limit,
       hasMore: page.length > limit,
     }
-    sendJson(res, 200, response)
-    return
+    return jsonResponse(200, response)
   }
 
   // GET /tags → return confirmed and backlog tag lists from prompt.md (mtime-cached)
@@ -230,8 +201,7 @@ export async function handleXApi(
     try {
       const mtime = statSync(promptPath).mtimeMs
       if (tagRegistryCache && tagRegistryCache.mtime === mtime) {
-        sendJson(res, 200, { tags: tagRegistryCache.tags, backlogTags: tagRegistryCache.backlogTags })
-        return
+        return jsonResponse(200, { tags: tagRegistryCache.tags, backlogTags: tagRegistryCache.backlogTags })
       }
 
       const content = readFileSync(promptPath, "utf-8")
@@ -247,21 +217,19 @@ export async function handleXApi(
       const backlogTags = backlogMatch ? parseNames(backlogMatch[1]!) : []
       tagRegistryCache = { mtime, tags, backlogTags }
 
-      sendJson(res, 200, { tags, backlogTags })
+      return jsonResponse(200, { tags, backlogTags })
     } catch (e: any) {
-      sendJson(res, 500, { error: "Failed to read prompt.md: " + (e.message || e) })
+      return jsonResponse(500, { error: "Failed to read prompt.md: " + (e.message || e) })
     }
-    return
   }
 
   // POST /tags/promote → promote a backlog tag to confirmed
   if (normalizedPath === "/tags/promote" && method === "POST") {
     try {
-      const body = await readBody(req)
+      const body = await readTextBody(request)
       const { tag } = JSON.parse(body) as { tag?: string }
       if (!tag || typeof tag !== "string") {
-        sendJson(res, 400, { error: "tag is required" })
-        return
+        return jsonResponse(400, { error: "tag is required" })
       }
 
       const promptPath = join(getProfileDir(), "jobs", "x_tag", "prompt.md")
@@ -269,8 +237,7 @@ export async function handleXApi(
       try {
         content = readFileSync(promptPath, "utf-8")
       } catch (e: any) {
-        sendJson(res, 500, { error: "Failed to read prompt.md: " + (e.message || e) })
-        return
+        return jsonResponse(500, { error: "Failed to read prompt.md: " + (e.message || e) })
       }
 
       // Parse sections
@@ -285,8 +252,7 @@ export async function handleXApi(
       const backlogEndIdx = content.indexOf(backlogEndMarker)
 
       if (tagsStartIdx === -1 || tagsEndIdx === -1 || backlogStartIdx === -1 || backlogEndIdx === -1) {
-        sendJson(res, 500, { error: "prompt.md is missing required marker comments" })
-        return
+        return jsonResponse(500, { error: "prompt.md is missing required marker comments" })
       }
 
       const tagsSection = content.slice(tagsStartIdx + tagsStartMarker.length, tagsEndIdx)
@@ -304,14 +270,12 @@ export async function handleXApi(
 
       if (confirmedTags.includes(tag)) {
         // Already confirmed — no-op
-        sendJson(res, 200, { ok: true })
-        return
+        return jsonResponse(200, { ok: true })
       }
 
       const backlogIdx = backlogTags.indexOf(tag)
       if (backlogIdx === -1) {
-        sendJson(res, 404, { error: `Tag "${tag}" not found in confirmed or backlog sections` })
-        return
+        return jsonResponse(404, { error: `Tag "${tag}" not found in confirmed or backlog sections` })
       }
 
       // Move the line from backlog to confirmed
@@ -339,16 +303,14 @@ export async function handleXApi(
       writeFileSync(promptPath, updated, "utf-8")
       log.info({ tag }, "Promoted tag from backlog to confirmed")
 
-      // Invalidate cache and notify SSE clients
+      // Invalidate cache and notify backend event subscribers
       invalidateCache()
-      const { broadcastSseEvent } = await import("../../server.js")
-      broadcastSseEvent("data-changed", { source: "x", reason: "tags" })
+      emitBackendEvent("data-changed", { source: "x", reason: "tags" })
 
-      sendJson(res, 200, { ok: true })
+      return jsonResponse(200, { ok: true })
     } catch (e: any) {
-      sendJson(res, 400, { error: e.message || "Invalid request body" })
+      return jsonResponse(400, { error: e.message || "Invalid request body" })
     }
-    return
   }
 
   // Match /:id/screenshot — query directly from DB to avoid loading the full cache
@@ -369,8 +331,7 @@ export async function handleXApi(
         break
       }
     }
-    sendJson(res, 200, { screenshot })
-    return
+    return jsonResponse(200, { screenshot })
   }
 
   // Match /:id → single post. Query directly so the list cache can stay slim.
@@ -386,13 +347,11 @@ export async function handleXApi(
       const row = result.rows[0] as { doc?: string | Record<string, unknown>; has_screenshot?: number } | undefined
       if (!row?.doc) continue
       const doc = parseXDoc(row.doc)
-      sendJson(res, 200, { item: itemFromDoc(id, doc, !!row.has_screenshot) })
-      return
+      return jsonResponse(200, { item: itemFromDoc(id, doc, !!row.has_screenshot) })
     }
 
-    sendJson(res, 404, { error: "Not found" })
-    return
+    return jsonResponse(404, { error: "Not found" })
   }
 
-  sendJson(res, 404, { error: "Not found" })
+  return jsonResponse(404, { error: "Not found" })
 }

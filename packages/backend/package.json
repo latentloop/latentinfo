@@ -4,10 +4,13 @@
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./embedded": "./dist/embedded.js"
+  },
   "scripts": {
     "build": "tsc --build",
-    "bundle": "node scripts/bundle.mjs",
-    "dev": "node --watch --watch-path=./src --import=tsx/esm src/index.ts -- --static-dir ../frontend/dist",
+    "dev": "tsc --build --watch --preserveWatchOutput",
     "check-types": "tsc --noEmit",
     "check-tracker-discipline": "node scripts/check-tracker-discipline.mjs",
     "lint": "pnpm check-tracker-discipline"

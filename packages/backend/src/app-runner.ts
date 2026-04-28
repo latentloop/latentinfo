@@ -24,9 +24,10 @@ import {
   type PageTarget,
 } from "./cdp.js"
 import { loadApps, loadAppScript, type AppDefinition } from "./apps.js"
-import { getProfileDir, loadConfig } from "./config.js"
+import { getProfileDir } from "./config.js"
 import { loadSettings } from "./settings.js"
 import { createLogger } from "./logger.js"
+import { emitBackendEvent } from "./events.js"
 
 const log = createLogger("runner")
 
@@ -341,15 +342,7 @@ function createLweContext(appName: string, appDir: string): LweContext {
     },
     openApp(route: string, params?: Record<string, string | number>): void {
       try {
-        const config = loadConfig()
-        const port = config.server.port
-        const host = config.server.host
-        const body = JSON.stringify({ route, label: appName, params })
-        fetch(`http://${host}:${port}/api/v1/gui/open-app`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body,
-        }).catch((e) => wrappedLog.debug("openApp fetch failed: " + String(e)))
+        emitBackendEvent("open-app", { route, label: appName, params })
       } catch (e) {
         wrappedLog.debug("openApp error: " + String(e))
       }

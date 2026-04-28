@@ -856,7 +856,7 @@ function JobConfigCell({ job, onSave }: { job: JobInfo; onSave: () => void }) {
 function JobRow({ job, onRunComplete, cdpConnected }: { job: JobInfo; onRunComplete: () => void; cdpConnected: boolean }) {
   const [running, setRunning] = useState(false);
   const [eventEnabled, setEventEnabled] = useState(job.eventEnabled === true);
-  // Re-sync when backend data changes (e.g. polling, SSE refresh)
+  // Re-sync when backend data changes (e.g. polling, backend event refresh)
   useEffect(() => { setEventEnabled(job.eventEnabled === true); }, [job.eventEnabled]);
   const [tweetModalOpen, setTweetModalOpen] = useState(false);
   const [tweetUrls, setTweetUrls] = useState("");
@@ -870,7 +870,7 @@ function JobRow({ job, onRunComplete, cdpConnected }: { job: JobInfo; onRunCompl
   const [articleModalOpen, setArticleModalOpen] = useState(false);
   const [articleUrls, setArticleUrls] = useState("");
 
-  // Clear running state when a new completed run arrives via SSE
+  // Clear running state when a new completed run arrives via backend events
   const lastRunRef = useRef(job.lastManualRun?.id);
   useEffect(() => {
     if (job.lastManualRun?.id !== lastRunRef.current) {

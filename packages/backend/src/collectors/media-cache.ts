@@ -10,6 +10,15 @@ import type { PageProxy } from "../collector-runner.js"
 import { createLogger } from "../logger.js"
 
 const log = createLogger("media-cache")
+const MAX_CACHED_IMAGES = 12
+const MAX_CACHED_IMAGE_BYTES = 3 * 1024 * 1024
+const MAX_CACHED_IMAGE_TOTAL_BYTES = 12 * 1024 * 1024
+
+export const __test__ = {
+  MAX_CACHED_IMAGES,
+  MAX_CACHED_IMAGE_BYTES,
+  MAX_CACHED_IMAGE_TOTAL_BYTES,
+}
 
 /**
  * Fetch a batch of image URLs from the page context, returning base64 data URIs.
@@ -30,22 +39,42 @@ export async function fetchCachedImages(
     const dataUris = await page.evaluate(`
       (async function() {
         var urls = ${JSON.stringify(unique)};
+        var maxImages = ${MAX_CACHED_IMAGES};
+        var maxImageBytes = ${MAX_CACHED_IMAGE_BYTES};
+        var maxTotalBytes = ${MAX_CACHED_IMAGE_TOTAL_BYTES};
         var results = {};
-        var promises = urls.map(function(url) {
-          return fetch(url, { mode: "cors", cache: "force-cache" })
-            .then(function(r) { return r.ok ? r.blob() : null; })
-            .then(function(blob) {
-              if (!blob) return;
-              return new Promise(function(resolve) {
-                var reader = new FileReader();
-                reader.onloadend = function() { results[url] = reader.result; resolve(); };
-                reader.onerror = function() { resolve(); };
-                reader.readAsDataURL(blob);
-              });
-            })
-            .catch(function() { /* skip failed fetches */ });
-        });
-        await Promise.all(promises);
+        var totalBytes = 0;
+        var imageCount = 0;
+
+        function readBlobAsDataUrl(blob) {
+          return new Promise(function(resolve) {
+            var reader = new FileReader();
+            reader.onloadend = function() {
+              resolve(typeof reader.result === "string" ? reader.result : null);
+            };
+            reader.onerror = function() { resolve(null); };
+            reader.readAsDataURL(blob);
+          });
+        }
+
+        for (var i = 0; i < urls.length; i++) {
+          if (imageCount >= maxImages || totalBytes >= maxTotalBytes) break;
+          var url = urls[i];
+          try {
+            var response = await fetch(url, { mode: "cors", cache: "force-cache" });
+            if (!response.ok) continue;
+            var blob = await response.blob();
+            if (!blob || blob.size > maxImageBytes) continue;
+            if (totalBytes + blob.size > maxTotalBytes) continue;
+            var dataUri = await readBlobAsDataUrl(blob);
+            if (!dataUri) continue;
+            results[url] = dataUri;
+            totalBytes += blob.size;
+            imageCount++;
+          } catch (e) {
+            // skip failed fetches
+          }
+        }
         return results;
       })()
     `) as Record<string, string> | null

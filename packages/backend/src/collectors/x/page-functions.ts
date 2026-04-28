@@ -555,6 +555,18 @@ export function startWatching(opts) {
   var tracker = window.__latent && window.__latent.__tracker
   var cid = opts.collectorId || "x"
 
+  var urlChangeNotifier = function() {
+    scheduleNotify("url-change", "mutation", "flat")
+  }
+  window.__latentXNotifyUrlChange = urlChangeNotifier
+  if (tracker) {
+    tracker.addCleanup(cid, function() {
+      if (window.__latentXNotifyUrlChange === urlChangeNotifier) {
+        delete window.__latentXNotifyUrlChange
+      }
+    })
+  }
+
   var scrollHandler = function() {
     var now = Date.now()
     if (now - lastScrollCheck < THROTTLE_MS) return

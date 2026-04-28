@@ -6,16 +6,17 @@
   "main": "./src/main.ts",
   "scripts": {
     "build": "tsc --build",
-    "dev": "echo '⚠ Do not run directly — use pnpm dev:all from root (needs Vite running first)' && electronmon --import=tsx/esm . --remote-debugging-port=9223",
+    "dev": "echo '⚠ Do not run directly — use pnpm dev:all from root (needs Vite and backend dist ready)' && electronmon --import=tsx/esm . --remote-debugging-port=9223",
     "check-types": "tsc --noEmit",
     "lint": "echo 'no lint configured'",
     "pack": "electron-builder --mac"
   },
   "electronmon": {
-    "patterns": ["src/**/*"],
+    "patterns": ["src/**/*", "../backend/dist/**/*"],
     "logLevel": "info"
   },
   "dependencies": {
+    "backend": "workspace:*",
     "electron-is-dev": "^3.0.1"
   },
   "devDependencies": {

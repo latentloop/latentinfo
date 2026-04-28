@@ -15,6 +15,7 @@ import { WebSocket } from "ws"
 import { createLogger } from "./logger.js"
 
 const log = createLogger("cdp")
+const CDP_MAX_PAYLOAD_BYTES = 512 * 1024 * 1024
 
 /** Name of the page->backend notification binding added to every attached target */
 export const NOTIFY_BINDING_NAME = "__latentInfoNotify"
@@ -91,7 +92,10 @@ export function attach(sessionName: string, wsUrl: string, timeoutMs = 5000, onD
     detach(sessionName)
 
     try {
-      const ws = new WebSocket(wsUrl, { timeout: timeoutMs })
+      const ws = new WebSocket(wsUrl, {
+        timeout: timeoutMs,
+        maxPayload: CDP_MAX_PAYLOAD_BYTES,
+      })
 
       const conn: CdpConnection = {
         ws, sessionName, wsUrl,

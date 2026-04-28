@@ -98,41 +98,51 @@ function RootLayout() {
     setActiveTabId((prev) => prev === id ? null : prev);
   }, [setActiveTabId]);
 
-  // Shared SSE connection — UI events via window, data events via QueryClient invalidation
+  // Shared backend events through Electron IPC.
   useEffect(() => {
-    const es = new EventSource("/api/v1/events");
-    es.addEventListener("open-app", (e) => {
-      try {
-        const data = JSON.parse(e.data) as { route: string; label?: string; params?: Record<string, string | number> };
-        openTab(data.route, data.label || data.route, data.route, data.params);
-        setTimeout(() => {
-          const iframe = document.querySelector(
-            `iframe[data-tab-id="${data.route}"]`,
-          ) as HTMLIFrameElement | null;
-          iframe?.contentWindow?.postMessage(
-            { type: "lwe:open-app", route: data.route, params: data.params || {} },
-            "*",
-          );
-        }, 100);
-      } catch { /* ignore malformed events */ }
-    });
-    es.addEventListener("data-changed", (e) => {
-      window.dispatchEvent(new CustomEvent("sse:data-changed", { detail: e.data }));
-    });
-    es.addEventListener("jobs-updated", () => {
-      queryClient.invalidateQueries({ queryKey: ["jobs"] });
-    });
-    es.addEventListener("session-changed", () => {
-      queryClient.invalidateQueries({ queryKey: ["sessions"] });
-    });
-    es.addEventListener("settings-changed", () => {
-      queryClient.invalidateQueries({ queryKey: ["settings"] });
-    });
-    es.onerror = () => {
-      // Reconnect gap — re-fetch all active queries to recover any missed updates
-      queryClient.invalidateQueries({ refetchType: "active" });
+    const handleBackendEvent = (eventName: string, rawData: unknown) => {
+      if (eventName === "open-app") {
+        try {
+          const data = typeof rawData === "string"
+            ? JSON.parse(rawData) as { route: string; label?: string; params?: Record<string, string | number> }
+            : rawData as { route: string; label?: string; params?: Record<string, string | number> };
+          openTab(data.route, data.label || data.route, data.route, data.params);
+          setTimeout(() => {
+            const iframe = document.querySelector(
+              `iframe[data-tab-id="${data.route}"]`,
+            ) as HTMLIFrameElement | null;
+            iframe?.contentWindow?.postMessage(
+              { type: "lwe:open-app", route: data.route, params: data.params || {} },
+              "*",
+            );
+          }, 100);
+        } catch { /* ignore malformed events */ }
+        return;
+      }
+
+      if (eventName === "data-changed") {
+        window.dispatchEvent(new CustomEvent("backend:data-changed", { detail: rawData }));
+        return;
+      }
+
+      if (eventName === "jobs-updated") {
+        queryClient.invalidateQueries({ queryKey: ["jobs"] });
+        window.dispatchEvent(new CustomEvent("backend:jobs-updated", { detail: rawData }));
+        return;
+      }
+
+      if (eventName === "session-changed") {
+        queryClient.invalidateQueries({ queryKey: ["sessions"] });
+        window.dispatchEvent(new CustomEvent("backend:session-changed", { detail: rawData }));
+        return;
+      }
+
+      if (eventName === "settings-changed") {
+        queryClient.invalidateQueries({ queryKey: ["settings"] });
+      }
     };
-    return () => es.close();
+
+    return window.electronAPI?.onBackendEvent?.(handleBackendEvent);
   }, [openTab]);
 
   const cycleTab = useCallback((direction: 1 | -1) => {
