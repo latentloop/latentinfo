@@ -32,7 +32,7 @@ const CATEGORIES: readonly FilterCategory<ArxivTokenType>[] = [
 const DATE_TYPES = new Set(["content_date", "collect_date"] as const)
 
 const PAGE_SIZE = 1000
-const SSE_DEBOUNCE_MS = 500
+const BACKEND_EVENT_DEBOUNCE_MS = 500
 
 export function ArxivPage({ dataSource, onDataSourceChange }: { dataSource: DataSource; onDataSourceChange: (v: DataSource) => void }) {
   const [items, setItems] = useState<ArxivItem[]>([])
@@ -133,15 +133,15 @@ export function ArxivPage({ dataSource, onDataSourceChange }: { dataSource: Data
   }, [])
 
   useEffect(() => {
-    let sseDebounce: ReturnType<typeof setTimeout> | null = null
-    const handleSse = () => {
-      if (sseDebounce) clearTimeout(sseDebounce)
-      sseDebounce = setTimeout(() => {
+    let backendEventDebounce: ReturnType<typeof setTimeout> | null = null
+    const handleBackendEvent = () => {
+      if (backendEventDebounce) clearTimeout(backendEventDebounce)
+      backendEventDebounce = setTimeout(() => {
         fetchAll(dateMode, tokensRef.current, liveTextRef.current, true)
-      }, SSE_DEBOUNCE_MS)
+      }, BACKEND_EVENT_DEBOUNCE_MS)
     }
-    window.addEventListener("sse:data-changed", handleSse)
-    return () => { window.removeEventListener("sse:data-changed", handleSse); if (sseDebounce) clearTimeout(sseDebounce) }
+    window.addEventListener("backend:data-changed", handleBackendEvent)
+    return () => { window.removeEventListener("backend:data-changed", handleBackendEvent); if (backendEventDebounce) clearTimeout(backendEventDebounce) }
   }, [fetchAll, dateMode])
 
   const handleDateModeChange = useCallback(

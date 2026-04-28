@@ -14,7 +14,7 @@ import type { Client } from "@libsql/client"
 import type { PageProxy } from "../../collector-runner.js"
 import type { XDocument } from "./types.js"
 import { emitJobEvent } from "../../job-runner.js"
-import { broadcastSseEvent } from "../../server.js"
+import { emitBackendEvent } from "../../events.js"
 import { createLogger } from "../../logger.js"
 import { fetchCachedImages } from "./media-cache.js"
 import {
@@ -288,7 +288,7 @@ export function createPageHandler(page: PageProxy, db: Client): void {
 
     // Badge existing tweets
     if (existingBadges.length > 0) {
-      await page.callModule(MODULE_NAME, "addBadges", existingBadges)
+      await page.callModule(MODULE_NAME, "addBadges", existingBadges, { lane: "badge" })
     }
 
     if (upsertRows.length === 0) {
@@ -461,13 +461,13 @@ export function createPageHandler(page: PageProxy, db: Client): void {
 
     // Badge newly saved tweets
     if (savedBadgeItems.length > 0) {
-      await page.callModule(MODULE_NAME, "addBadges", savedBadgeItems)
+      await page.callModule(MODULE_NAME, "addBadges", savedBadgeItems, { lane: "badge" })
     }
 
-    // Notify job system and SSE clients about new tweets
+    // Notify job system and backend event subscribers about new tweets
     if (newRows > 0) {
       emitJobEvent("x:collected", { saved, newRows })
-      broadcastSseEvent("data-changed", { source: "x", count: saved })
+      emitBackendEvent("data-changed", { source: "x", count: saved })
     }
 
     const totalMs = Date.now() - scrapeStartedAt

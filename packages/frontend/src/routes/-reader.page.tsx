@@ -199,10 +199,10 @@ function formatDate(iso: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// SSE debounce constant
+// backend event debounce constant
 // ---------------------------------------------------------------------------
 
-const SSE_DEBOUNCE_MS = 500
+const BACKEND_EVENT_DEBOUNCE_MS = 500
 
 // ---------------------------------------------------------------------------
 // Markdown rendering: math components + stable plugin arrays
@@ -501,33 +501,36 @@ export function ReaderPage() {
     // If no match, fall through to default (latest version)
   }, [versionsMap, selectedId, articles])
 
-  // SSE push — refresh articles when new clips arrive or markdown jobs complete
+  // backend event — refresh articles when new clips arrive or markdown jobs complete
   useEffect(() => {
-    let sseDebounce: ReturnType<typeof setTimeout> | null = null
+    let backendEventDebounce: ReturnType<typeof setTimeout> | null = null
 
-    const handleSse = () => {
-      if (sseDebounce) clearTimeout(sseDebounce)
-      sseDebounce = setTimeout(() => {
+    const handleBackendEvent = () => {
+      if (backendEventDebounce) clearTimeout(backendEventDebounce)
+      backendEventDebounce = setTimeout(() => {
         fetchArticles(true)
-      }, SSE_DEBOUNCE_MS)
+      }, BACKEND_EVENT_DEBOUNCE_MS)
     }
 
     // data-changed: emitted when articles change (future-proofing)
-    window.addEventListener("sse:data-changed", handleSse)
+    window.addEventListener("backend:data-changed", handleBackendEvent)
 
     // jobs-updated: emitted on job start/complete — refresh when web_clip_markdown finishes
     const handleJobsUpdated = (e: Event) => {
       try {
-        const payload = JSON.parse((e as CustomEvent<string>).detail)
-        if (payload?.jobId === "web_clip_markdown") handleSse()
+        const detail = (e as CustomEvent<unknown>).detail
+        const payload = typeof detail === "string"
+          ? JSON.parse(detail) as { jobId?: string }
+          : detail as { jobId?: string } | null
+        if (payload?.jobId === "web_clip_markdown") handleBackendEvent()
       } catch { /* ignore malformed */ }
     }
-    window.addEventListener("sse:jobs-updated", handleJobsUpdated)
+    window.addEventListener("backend:jobs-updated", handleJobsUpdated)
 
     return () => {
-      window.removeEventListener("sse:data-changed", handleSse)
-      window.removeEventListener("sse:jobs-updated", handleJobsUpdated)
-      if (sseDebounce) clearTimeout(sseDebounce)
+      window.removeEventListener("backend:data-changed", handleBackendEvent)
+      window.removeEventListener("backend:jobs-updated", handleJobsUpdated)
+      if (backendEventDebounce) clearTimeout(backendEventDebounce)
     }
   }, [fetchArticles])
 

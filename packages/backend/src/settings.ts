@@ -24,7 +24,6 @@ export interface BrowserEntry {
 export interface AppSettings {
   autoAttach: boolean
   browsers: BrowserEntry[]
-  server?: { port?: number; host?: string }
   remoteDebuggingAutoAllow?: boolean
   logLevel?: string
 }

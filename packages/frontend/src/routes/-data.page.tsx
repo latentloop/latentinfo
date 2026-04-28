@@ -12,7 +12,7 @@ const DAY_FETCH_PAGE_SIZE = 1000
 const DAY_BATCH_COUNT = 2
 const HOUR_GROUP_INITIAL_THREADS = 18
 const HOUR_GROUP_LOAD_MORE_THREADS = 18
-const SSE_DEBOUNCE_MS = 500
+const BACKEND_EVENT_DEBOUNCE_MS = 500
 
 import type { DataSource } from "@/components/source-selector"
 
@@ -65,7 +65,7 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
   const fetchGenRef = useRef(0)
   const loadedDatesRef = useRef<string[]>([])
   const dataFingerprintRef = useRef("")
-  const pendingSseRefreshRef = useRef(false)
+  const pendingBackendRefreshRef = useRef(false)
 
   // Build query params from tokens + live text
   function buildFilterParams(toks: FilterToken[], live: string): { q: string; user?: string; tag?: string; dateField?: string; dateFrom?: string; dateTo?: string } {
@@ -358,10 +358,10 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
           loadingMoreRef.current = false
           setLoading(false)
           setLoadingMore(false)
-          if (!isPoll && pendingSseRefreshRef.current) {
-            pendingSseRefreshRef.current = false
+          if (!isPoll && pendingBackendRefreshRef.current) {
+            pendingBackendRefreshRef.current = false
             window.setTimeout(() => {
-              window.dispatchEvent(new CustomEvent("sse:data-changed"))
+              window.dispatchEvent(new CustomEvent("backend:data-changed"))
             }, 0)
           }
         }
@@ -408,14 +408,14 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // SSE push — refetch when backend pushes data-changed (debounced for burst saves)
+  // backend event — refetch when backend pushes data-changed (debounced for burst saves)
   useEffect(() => {
-    let sseDebounce: ReturnType<typeof setTimeout> | null = null
-    const handleSse = () => {
-      if (sseDebounce) clearTimeout(sseDebounce)
-      sseDebounce = setTimeout(() => {
+    let backendEventDebounce: ReturnType<typeof setTimeout> | null = null
+    const handleBackendEvent = () => {
+      if (backendEventDebounce) clearTimeout(backendEventDebounce)
+      backendEventDebounce = setTimeout(() => {
         if (loadingRef.current || loadingMoreRef.current) {
-          pendingSseRefreshRef.current = true
+          pendingBackendRefreshRef.current = true
           fetchTagRegistry()
           return
         }
@@ -424,12 +424,12 @@ export function XPage({ dataSource, onDataSourceChange }: { dataSource: DataSour
           refreshDates: loadedDatesRef.current,
         })
         fetchTagRegistry()
-      }, SSE_DEBOUNCE_MS)
+      }, BACKEND_EVENT_DEBOUNCE_MS)
     }
-    window.addEventListener("sse:data-changed", handleSse)
+    window.addEventListener("backend:data-changed", handleBackendEvent)
     return () => {
-      window.removeEventListener("sse:data-changed", handleSse)
-      if (sseDebounce) clearTimeout(sseDebounce)
+      window.removeEventListener("backend:data-changed", handleBackendEvent)
+      if (backendEventDebounce) clearTimeout(backendEventDebounce)
     }
   }, [fetchDay, fetchTagRegistry, dateMode, sort])
 

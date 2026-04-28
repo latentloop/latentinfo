@@ -166,6 +166,9 @@ importers:
 
   packages/gui:
     dependencies:
+      backend:
+        specifier: workspace:*
+        version: link:../backend
       electron-is-dev:
         specifier: ^3.0.1
         version: 3.0.1

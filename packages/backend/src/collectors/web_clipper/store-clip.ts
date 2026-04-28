@@ -7,7 +7,7 @@
 
 import { createHash } from "node:crypto"
 import { emitJobEvent } from "../../job-runner.js"
-import { broadcastSseEvent } from "../../server.js"
+import { emitBackendEvent } from "../../events.js"
 import { insertArticle, type ArticleRow } from "../../storage/article-db.js"
 import { createLogger } from "../../logger.js"
 
@@ -108,7 +108,7 @@ export async function storeClip(params: StoreClipParams): Promise<{ clipId: stri
     await insertArticle(row)
     log.info({ clipId, url, title }, "Clip stored")
     emitJobEvent("web_clip:collected", { clipId })
-    broadcastSseEvent("data-changed", { source: "web_clipper" })
+    emitBackendEvent("data-changed", { source: "web_clipper" })
     return { clipId, sourceKey }
   } catch (e: unknown) {
     log.error({ clipId, error: e instanceof Error ? e.message : e }, "Failed to store clip")

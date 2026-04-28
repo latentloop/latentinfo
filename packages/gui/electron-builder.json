@@ -12,14 +12,10 @@
   },
   "files": [
     "dist/**/*",
-    "icons/**/*"
+    "icons/**/*",
+    "package.json"
   ],
   "extraResources": [
-    {
-      "from": ".backend-bundle",
-      "to": "backend",
-      "filter": ["dist/**/*.mjs", "node_modules/**/*", "package.json"]
-    },
     {
       "from": "../frontend/dist",
       "to": "frontend",

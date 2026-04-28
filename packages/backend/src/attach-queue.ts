@@ -97,6 +97,12 @@ function readActiveTabHint(appPath: string): ActiveTabHint | undefined {
   }
 }
 
+function handleUnexpectedDisconnect(sessionName: string): void {
+  stopCollectorRunner(sessionName)
+  lastDetachTime.set(sessionName, Date.now())
+  _onSessionChange?.("session-disconnected", sessionName)
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -160,7 +166,7 @@ export async function requestManualAttach(sessionName: string, wsUrl: string): P
   log.info({ sessionName }, "Manual attach requested")
   _triggerDialogBurst?.()
   _lastAttachStartMs = Date.now()
-  const ok = await attach(sessionName, wsUrl, 5000, () => _onSessionChange?.("session-disconnected", sessionName))
+  const ok = await attach(sessionName, wsUrl, 5000, () => handleUnexpectedDisconnect(sessionName))
   const attachMs = Date.now() - _lastAttachStartMs
   if (ok) {
     _onSessionChange?.("session-attached", sessionName)
@@ -169,7 +175,11 @@ export async function requestManualAttach(sessionName: string, wsUrl: string): P
       const session = refreshSessions(_browsers).find((s) => s.sessionName === sessionName)
       await startCollectorRunner(sessionName, _collectors, _db, session ? readActiveTabHint(session.appPath) : undefined)
     }
-    _onSessionChange?.("session-ready", sessionName)
+    if (isAttached(sessionName)) {
+      _onSessionChange?.("session-ready", sessionName)
+    } else {
+      log.warn({ sessionName }, "Manual attach disconnected before ready")
+    }
   } else {
     log.warn({ sessionName, attachMs }, "Manual attach failed")
   }
@@ -260,7 +270,7 @@ async function processQueue(targetSessions?: ReadonlySet<string>): Promise<void>
       _lastAttachStartMs = Date.now()
 
       try {
-        const onDisconnect = () => _onSessionChange?.("session-disconnected", sn)
+        const onDisconnect = () => handleUnexpectedDisconnect(sn)
         let ok = await attach(sn, wsUrl, 5000, onDisconnect)
 
         // First attempt likely fails with 403 (dialog just appeared).
@@ -279,7 +289,11 @@ async function processQueue(targetSessions?: ReadonlySet<string>): Promise<void>
           if (_db) {
             await startCollectorRunner(sn, _collectors, _db, readActiveTabHint(session.appPath))
           }
-          _onSessionChange?.("session-ready", sn)
+          if (isAttached(sn)) {
+            _onSessionChange?.("session-ready", sn)
+          } else {
+            log.warn({ sn }, "Auto-attach disconnected before ready")
+          }
         } else {
           log.warn({ sn, attachMs }, "Auto-attach failed")
         }

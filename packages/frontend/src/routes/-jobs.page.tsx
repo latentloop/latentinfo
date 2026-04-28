@@ -134,9 +134,9 @@ export function JobRunsPage() {
 
   useEffect(() => {
     fetchRuns()
-    const handleSse = () => fetchRuns()
-    window.addEventListener("sse:jobs-updated", handleSse)
-    return () => { window.removeEventListener("sse:jobs-updated", handleSse) }
+    const handleBackendEvent = () => fetchRuns()
+    window.addEventListener("backend:jobs-updated", handleBackendEvent)
+    return () => { window.removeEventListener("backend:jobs-updated", handleBackendEvent) }
   }, [fetchRuns])
 
   // Watch for URL ?job= param changes (e.g., navigation from dashboard link)

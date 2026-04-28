@@ -526,6 +526,9 @@ export async function injectActionLogic(page: PageProxy, logLevel: string, fresh
         lastUrl = location.href;
         resetNavState();
         L("debug", "URL changed, navState reset");
+        try {
+          if (typeof window.__latentXNotifyUrlChange === "function") window.__latentXNotifyUrlChange();
+        } catch(e) {}
       }
     }
     window.__latentUrlChangeHandler = onUrlMaybeChanged;

@@ -25,6 +25,93 @@ test("decideTargetInfoChange attaches a brand-new http target when idle", () => 
   assert.equal(actual, "attach-now")
 })
 
+test("decideTargetInfoChange clears known targets that leave http", () => {
+  const actual = __test__.decideTargetInfoChange(
+    true,
+    "https://x.com/home",
+    "chrome://newtab/",
+    false,
+  )
+
+  assert.equal(actual, "clear")
+})
+
+test("decideTargetInfoChange rechecks incomplete known targets", () => {
+  assert.equal(__test__.decideTargetInfoChange(
+    true,
+    "https://x.com/home",
+    "https://x.com/openai",
+    false,
+    false,
+  ), "check-now")
+
+  assert.equal(__test__.decideTargetInfoChange(
+    true,
+    "https://x.com/home",
+    "https://x.com/openai",
+    true,
+    false,
+  ), "queue-check")
+})
+
+test("decideTargetInfoChange keeps fully injected handlers across SPA route updates", () => {
+  const actual = __test__.decideTargetInfoChange(
+    true,
+    "https://x.com/home",
+    "https://x.com/openai",
+    false,
+    true,
+  )
+
+  assert.equal(actual, "update-url")
+})
+
+test("decideTargetInfoChange keeps fully injected handlers across hash-only URL updates", () => {
+  const actual = __test__.decideTargetInfoChange(
+    true,
+    "https://x.com/openai/status/123",
+    "https://x.com/openai/status/123#ref",
+    false,
+    true,
+  )
+
+  assert.equal(actual, "update-url")
+})
+
+test("getUrlChangePageHandlerCollectors only selects injected opt-in collectors", () => {
+  const collectors = [
+    {
+      id: "x",
+      description: "Save tweets",
+      urlPatterns: ["https://x.com/*"],
+      pageHandler: () => {},
+    },
+    {
+      id: "web_clip",
+      description: "Clip web content",
+      urlPatterns: ["https://x.com/*"],
+      pageHandler: () => {},
+      rerunPageHandlerOnUrlChange: true,
+    },
+    {
+      id: "github",
+      description: "Save GitHub repositories",
+      urlPatterns: ["https://github.com/*/*"],
+      pageHandler: () => {},
+      rerunPageHandlerOnUrlChange: true,
+    },
+  ]
+
+  assert.deepEqual(
+    __test__.getUrlChangePageHandlerCollectors(
+      "https://x.com/junfanzhu98/status/2048096260578767044",
+      collectors,
+      new Set(["x", "web_clip"]),
+    ).map((collector) => collector.id),
+    ["web_clip"],
+  )
+})
+
 test("isPageReadyForCollectors rejects the initial blank document", () => {
   const actual = __test__.isPageReadyForCollectors({
     hasBody: true,
@@ -143,6 +230,13 @@ test("isDuplicateLocationCheck coalesces near-identical location events", () => 
   assert.equal(__test__.isDuplicateLocationCheck(previous, "https://x.com/explore", 1500), false)
 })
 
+test("isStaleSessionError treats closed CDP connections as stale", () => {
+  assert.equal(__test__.isStaleSessionError(new Error("CDP session closed")), true)
+  assert.equal(__test__.isStaleSessionError(new Error("CDP not connected")), true)
+  assert.equal(__test__.isStaleSessionError(new Error("Session with given id not found")), true)
+  assert.equal(__test__.isStaleSessionError(new Error("CDP command timeout: Runtime.evaluate")), false)
+})
+
 test("hasCompleteCollectorInjection requires action handler injection when present", () => {
   const pageOnlyCollector = {
     id: "page-only",
@@ -187,4 +281,102 @@ test("orderPageTargetsForInitialAttach matches active tab hint without hash", ()
 
   assert.deepEqual(actual.active.map((target) => target.targetId), ["active"])
   assert.deepEqual(actual.rest, [])
+})
+
+test("runWithConcurrency caps parallel startup work without dropping items", async () => {
+  let active = 0
+  let maxActive = 0
+  const completed: number[] = []
+
+  await __test__.runWithConcurrency([1, 2, 3, 4, 5], 2, async (item) => {
+    active += 1
+    maxActive = Math.max(maxActive, active)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    completed.push(item)
+    active -= 1
+  })
+
+  assert.equal(maxActive, 2)
+  assert.deepEqual(completed.sort((a, b) => a - b), [1, 2, 3, 4, 5])
+})
+
+test("CdpCommandQueue rejects stale generation work after invalidation", async () => {
+  const queue = new __test__.CdpCommandQueue()
+  const targetId = "target-1"
+  const oldGeneration = queue.generation(targetId)
+  let staleRan = false
+
+  queue.invalidate(targetId)
+
+  await assert.rejects(
+    queue.enqueue(targetId, oldGeneration, "default", async () => {
+      staleRan = true
+    }),
+    /stale target generation/,
+  )
+
+  await queue.enqueue(targetId, queue.generation(targetId), "default", async () => {
+    return "fresh"
+  })
+
+  assert.equal(staleRan, false)
+})
+
+test("CdpCommandQueue lanes let badge work bypass slow default work", async () => {
+  const queue = new __test__.CdpCommandQueue()
+  const targetId = "target-1"
+  const generation = queue.generation(targetId)
+  const events: string[] = []
+  let releaseDefault: () => void = () => {
+    throw new Error("default command was not started")
+  }
+
+  const firstDefault = queue.enqueue(targetId, generation, "default", () => {
+    events.push("default-start")
+    return new Promise<void>((resolve) => {
+      releaseDefault = resolve
+    })
+  })
+  const secondDefault = queue.enqueue(targetId, generation, "default", async () => {
+    events.push("default-second")
+  })
+  const badge = queue.enqueue(targetId, generation, "badge", async () => {
+    events.push("badge")
+  })
+
+  await badge
+  assert.deepEqual(events, ["default-start", "badge"])
+
+  releaseDefault()
+  await Promise.all([firstDefault, secondDefault])
+
+  assert.deepEqual(events, ["default-start", "badge", "default-second"])
+})
+
+test("CdpCommandQueue prioritizes pending active-page work in a lane", async () => {
+  const queue = new __test__.CdpCommandQueue()
+  const targetId = "target-1"
+  const generation = queue.generation(targetId)
+  const events: string[] = []
+  let releaseDefault: () => void = () => {
+    throw new Error("default command was not started")
+  }
+
+  const first = queue.enqueue(targetId, generation, "default", () => {
+    events.push("first")
+    return new Promise<void>((resolve) => {
+      releaseDefault = resolve
+    })
+  })
+  const background = queue.enqueue(targetId, generation, "default", async () => {
+    events.push("background")
+  })
+  const active = queue.enqueue(targetId, generation, "default", async () => {
+    events.push("active")
+  }, 100)
+
+  releaseDefault()
+  await Promise.all([first, background, active])
+
+  assert.deepEqual(events, ["first", "active", "background"])
 })

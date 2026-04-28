@@ -12,20 +12,77 @@ import type { ArxivDocument } from "./types.js"
 import { extractPaper, addBadge } from "./page-functions.js"
 import { createLogger } from "../../logger.js"
 import { emitJobEvent } from "../../job-runner.js"
-import { broadcastSseEvent } from "../../server.js"
+import { emitBackendEvent } from "../../events.js"
 
 const log = createLogger("arxiv")
 const MODULE_NAME = "li_arxiv"
 
+interface RawArxivPaper {
+  arxivId: string
+  title: string
+  authors: string[]
+  abstract: string
+  categories: string[]
+  submittedAt: string
+  pdfUrl: string
+  url: string
+  versions: { version: string; date: string; size: string }[]
+}
+
+function parseStoredDoc(raw: unknown): ArxivDocument | null {
+  if (!raw) return null
+  try {
+    return typeof raw === "string"
+      ? JSON.parse(raw) as ArxivDocument
+      : raw as ArxivDocument
+  } catch {
+    return null
+  }
+}
+
+function sameStringArray(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+  const left = a ?? []
+  const right = b ?? []
+  if (left.length !== right.length) return false
+  return left.every((value, index) => value === right[index])
+}
+
+function sameVersions(
+  a: ArxivDocument["versions"],
+  b: RawArxivPaper["versions"],
+): boolean {
+  const left = a ?? []
+  const right = b ?? []
+  if (left.length !== right.length) return false
+  return left.every((value, index) => {
+    const other = right[index]
+    return Boolean(other) &&
+      value.version === other.version &&
+      value.date === other.date &&
+      value.size === other.size
+  })
+}
+
+function hasPaperInfoChanged(existing: ArxivDocument, raw: RawArxivPaper): boolean {
+  return existing.arxivId !== raw.arxivId ||
+    existing.title !== raw.title ||
+    !sameStringArray(existing.authors, raw.authors) ||
+    existing.abstract !== raw.abstract ||
+    !sameStringArray(existing.categories, raw.categories) ||
+    existing.submittedAt !== raw.submittedAt ||
+    existing.pdfUrl !== raw.pdfUrl ||
+    !sameVersions(existing.versions, raw.versions)
+}
+
 export function createPageHandler(page: PageProxy, db: Client): void {
-  async function findExistingDoc(docId: string): Promise<{ collectedAt: string } | null> {
+  async function findExistingDoc(docId: string): Promise<ArxivDocument | null> {
     try {
       const result = await db.execute({
-        sql: "SELECT json_extract(doc, '$.collectedAt') as ca FROM documents WHERE id = ? LIMIT 1",
+        sql: "SELECT doc FROM documents WHERE id = ? LIMIT 1",
         args: [docId],
       })
       if (result.rows.length === 0) return null
-      return { collectedAt: (result.rows[0]!.ca as string) || "" }
+      return parseStoredDoc(result.rows[0]!.doc)
     } catch {
       return null
     }
@@ -67,17 +124,7 @@ export function createPageHandler(page: PageProxy, db: Client): void {
       })
 
       // 3. Extract paper metadata
-      const raw = await page.callModule(MODULE_NAME, "extractPaper") as {
-        arxivId: string
-        title: string
-        authors: string[]
-        abstract: string
-        categories: string[]
-        submittedAt: string
-        pdfUrl: string
-        url: string
-        versions: { version: string; date: string; size: string }[]
-      }
+      const raw = await page.callModule(MODULE_NAME, "extractPaper") as RawArxivPaper | null
 
       if (!raw || !raw.arxivId) {
         log.debug("No arxiv ID found on page, skipping")
@@ -87,7 +134,7 @@ export function createPageHandler(page: PageProxy, db: Client): void {
       const docId = `arxiv:${raw.arxivId}`
       const existing = await findExistingDoc(docId)
 
-      if (existing) {
+      if (existing && !hasPaperInfoChanged(existing, raw)) {
         await page.callModule(MODULE_NAME, "addBadge", { isNew: false, collectedAt: existing.collectedAt })
         log.debug(`Paper ${raw.arxivId} already collected`)
         return
@@ -112,11 +159,15 @@ export function createPageHandler(page: PageProxy, db: Client): void {
       if (ok) {
         await page.callModule(MODULE_NAME, "addBadge", { isNew: true, collectedAt: doc.collectedAt })
         emitJobEvent("arxiv:collected", { arxivId: raw.arxivId })
-        broadcastSseEvent("data-changed", { source: "arxiv" })
-        log.info(`Collected paper: ${raw.arxivId} — ${raw.title.slice(0, 60)}`)
+        emitBackendEvent("data-changed", { source: "arxiv" })
+        log.info(`${existing ? "Updated" : "Collected"} paper: ${raw.arxivId} — ${raw.title.slice(0, 60)}`)
       }
     } catch (e: unknown) {
       log.error(`arxiv scrape error: ${e instanceof Error ? e.message : e}`)
     }
   })()
+}
+
+export const __test__ = {
+  hasPaperInfoChanged,
 }

@@ -29,7 +29,7 @@ const CATEGORIES: readonly FilterCategory<GithubTokenType>[] = [
 const DATE_TYPES = new Set(["collect_date"] as const)
 
 const PAGE_SIZE = 1000
-const SSE_DEBOUNCE_MS = 500
+const BACKEND_EVENT_DEBOUNCE_MS = 500
 
 export function GithubPage({ dataSource, onDataSourceChange }: { dataSource: DataSource; onDataSourceChange: (v: DataSource) => void }) {
   const [items, setItems] = useState<GithubItem[]>([])
@@ -122,17 +122,17 @@ export function GithubPage({ dataSource, onDataSourceChange }: { dataSource: Dat
   }, [])
 
   useEffect(() => {
-    let sseDebounce: ReturnType<typeof setTimeout> | null = null
-    const handleSse = () => {
-      if (sseDebounce) clearTimeout(sseDebounce)
-      sseDebounce = setTimeout(() => {
+    let backendEventDebounce: ReturnType<typeof setTimeout> | null = null
+    const handleBackendEvent = () => {
+      if (backendEventDebounce) clearTimeout(backendEventDebounce)
+      backendEventDebounce = setTimeout(() => {
         fetchAll(sortField, tokensRef.current, liveTextRef.current, true)
-      }, SSE_DEBOUNCE_MS)
+      }, BACKEND_EVENT_DEBOUNCE_MS)
     }
-    window.addEventListener("sse:data-changed", handleSse)
+    window.addEventListener("backend:data-changed", handleBackendEvent)
     return () => {
-      window.removeEventListener("sse:data-changed", handleSse)
-      if (sseDebounce) clearTimeout(sseDebounce)
+      window.removeEventListener("backend:data-changed", handleBackendEvent)
+      if (backendEventDebounce) clearTimeout(backendEventDebounce)
     }
   }, [fetchAll, sortField])
 

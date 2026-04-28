@@ -52,6 +52,7 @@ test("injectActionLogic rebinds URL-change handling after reinjection so tweet-o
 
   const listeners = new Map<string, Function[]>()
   let dotRemovals = 0
+  let urlChangeNotifications = 0
 
   const focusDot = {
     remove() {
@@ -117,6 +118,9 @@ test("injectActionLogic rebinds URL-change handling after reinjection so tweet-o
       now() { return 0 },
     },
     WheelEvent: function() {},
+    __latentXNotifyUrlChange() {
+      urlChangeNotifications++
+    },
     Math,
     Date,
   }
@@ -131,6 +135,7 @@ test("injectActionLogic rebinds URL-change handling after reinjection so tweet-o
   windowObject.console = context.console
   windowObject.performance = context.performance
   windowObject.WheelEvent = context.WheelEvent
+  windowObject.__latentXNotifyUrlChange = context.__latentXNotifyUrlChange
   windowObject.Math = Math
   windowObject.Date = Date
 
@@ -151,4 +156,5 @@ test("injectActionLogic rebinds URL-change handling after reinjection so tweet-o
   context.history.pushState()
 
   assert.ok(dotRemovals > 0)
+  assert.equal(urlChangeNotifications, 2)
 })

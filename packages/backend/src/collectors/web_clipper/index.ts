@@ -25,6 +25,8 @@ const webClipperCollector: CollectorDefinition = {
   pageHandler(page, _db) {
     createPageHandler(page)
   },
+
+  rerunPageHandlerOnUrlChange: true,
 }
 
 export default webClipperCollector

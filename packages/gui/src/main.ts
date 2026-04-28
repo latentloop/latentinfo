@@ -1,12 +1,11 @@
 /**
  * Electron main process for LatentInfo.
  *
- * - Spawns the backend as a child process
- * - Waits for backend health check before creating the window
- * - Creates BrowserWindow pointing to the frontend
+ * - Starts the backend in-process
+ * - Exposes backend routes through the latent-info://app custom protocol
+ * - Creates BrowserWindow pointing to the custom protocol frontend
  * - System tray with show/hide
  * - Hide on close (minimize to tray) instead of quit
- * - Cmd+Q actually quits, kills backend child process
  */
 
 import {
@@ -18,11 +17,11 @@ import {
   nativeImage,
   dialog,
   ipcMain,
+  protocol,
+  type WebContents,
 } from "electron"
-import { spawn, type ChildProcess } from "node:child_process"
 import { join, dirname } from "node:path"
-import { fileURLToPath } from "node:url"
-import { get as httpGet } from "node:http"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { writeFile, readFile } from "node:fs/promises"
 import { existsSync, mkdirSync } from "node:fs"
 import { homedir } from "node:os"
@@ -31,12 +30,14 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
 const _home = homedir()
+
 /** Expand ~/... to absolute path. */
 function expandHome(path: string): string {
   if (path === "~") return _home
   if (path.startsWith("~/")) return join(_home, path.slice(2))
   return path
 }
+
 /** Shorten absolute path for display: replace homedir prefix with ~. */
 function shortenHome(path: string): string {
   if (path === _home) return "~"
@@ -48,14 +49,22 @@ function shortenHome(path: string): string {
 // Constants
 // ---------------------------------------------------------------------------
 
-const BACKEND_HOST = "127.0.0.1"
-const BACKEND_PORT = 9821
-const BACKEND_URL = `http://${BACKEND_HOST}:${BACKEND_PORT}`
+const APP_PROTOCOL = "latent-info"
+const APP_ORIGIN = `${APP_PROTOCOL}://app`
+const VITE_DEV_URL = process.env.VITE_DEV_URL || "http://127.0.0.1:5173"
 
-const VITE_DEV_URL = process.env.VITE_DEV_URL || "http://localhost:5173"
-
-const HEALTH_POLL_INTERVAL_MS = 500
-const HEALTH_TIMEOUT_MS = 10_000
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: APP_PROTOCOL,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+    },
+  },
+])
 
 // ---------------------------------------------------------------------------
 // State
@@ -66,124 +75,105 @@ let mainWindow: BrowserWindow | null = null
 /** Whether the macOS dock API is available. */
 const hasDock = process.platform === "darwin"
 let tray: Tray | null = null
-let backendProcess: ChildProcess | null = null
 let isQuitting = false
+let isStoppingBackend = false
+let backend: EmbeddedBackend | null = null
+let backendEventsCleanup: (() => void) | null = null
+const backendEventSubscribers = new Set<WebContents>()
+let signalShutdown: Promise<void> | null = null
+
+interface BackendEvent {
+  event: string
+  data: unknown
+}
+
+interface EmbeddedBackend {
+  handleRequest(request: Request): Promise<Response>
+  onEvent(listener: (payload: BackendEvent) => void): () => void
+  stop(): Promise<void>
+}
+
+interface BackendModule {
+  startBackend(options?: { staticDir?: string }): Promise<EmbeddedBackend>
+}
 
 // ---------------------------------------------------------------------------
 // Backend management
 // ---------------------------------------------------------------------------
 
-function spawnBackend(): ChildProcess {
-  const isPackaged = app.isPackaged
-
-  let command: string
-  let args: string[]
-
-  if (isPackaged) {
-    // Production: backend is bundled into resources, use Electron's bundled Node.js
-    const backendEntry = join(process.resourcesPath, "backend", "dist", "bundle.mjs")
-    if (!existsSync(backendEntry)) {
-      dialog.showErrorBox("Backend Missing", `Backend not found at:\n${backendEntry}`)
-      app.quit()
-    }
-    const frontendDir = join(process.resourcesPath, "frontend")
-    command = process.execPath
-    args = [backendEntry, "--static-dir", frontendDir]
-  } else {
-    // Development: use tsx to run TypeScript source directly
-    // NOTE: process.execPath is the Electron binary, not node — use "node" from PATH
-    const backendSrc = join(__dirname, "..", "..", "backend", "src", "index.ts")
-    const backendWatchPath = join(__dirname, "..", "..", "backend", "src")
-    command = "node"
-
-    // In test mode, no --watch (tests need stable process)
-    const staticDir = process.env.LATENT_INFO_STATIC_DIR
-    if (staticDir) {
-      args = ["--import=tsx/esm", backendSrc, "--static-dir", staticDir]
-    } else {
-      // Dev mode: --watch auto-restarts backend on source changes
-      args = ["--watch", "--watch-path", backendWatchPath, "--import=tsx/esm", backendSrc]
-    }
-  }
-
-  // When reusing the Electron binary as a Node runtime, ELECTRON_RUN_AS_NODE
-  // must be set; in dev mode explicitly clear it to prevent env inheritance.
-  const backendEnv = {
-    ...process.env,
-    ELECTRON_RUN_AS_NODE: isPackaged ? "1" : "",
-  }
-
-  console.log(`[gui] Spawning backend: ${command} ${args.join(" ")}`)
-
-  const child = spawn(command, args, {
-    stdio: ["ignore", "pipe", "pipe"],
-    env: backendEnv,
-  })
-
-  child.stdout?.on("data", (data: Buffer) => {
-    process.stdout.write(`[backend] ${data.toString()}`)
-  })
-
-  child.stderr?.on("data", (data: Buffer) => {
-    process.stderr.write(`[backend:err] ${data.toString()}`)
-  })
-
-  child.on("exit", (code, signal) => {
-    console.log(`[gui] Backend exited (code=${code}, signal=${signal})`)
-    backendProcess = null
-  })
-
-  child.on("error", (err) => {
-    console.error(`[gui] Failed to spawn backend:`, err)
-    backendProcess = null
-  })
-
-  return child
+function getStaticDir(): string | undefined {
+  if (process.env.LATENT_INFO_STATIC_DIR) return process.env.LATENT_INFO_STATIC_DIR
+  if (app.isPackaged) return join(process.resourcesPath, "frontend")
+  return undefined
 }
 
-function killBackend(): void {
-  if (!backendProcess) return
-  console.log("[gui] Killing backend process")
-  backendProcess.kill("SIGTERM")
-  // Force kill after a grace period
-  const pid = backendProcess.pid
-  setTimeout(() => {
-    try {
-      if (pid) process.kill(pid, "SIGKILL")
-    } catch {
-      // already dead
+async function loadBackendModule(): Promise<BackendModule> {
+  if (app.isPackaged) {
+    const backendPackage = "backend/embedded"
+    return await import(backendPackage) as BackendModule
+  }
+  const backendDist = join(__dirname, "..", "..", "backend", "dist", "embedded.js")
+  return await import(pathToFileURL(backendDist).href) as BackendModule
+}
+
+async function startEmbeddedBackend(): Promise<void> {
+  if (backend) return
+  const module = await loadBackendModule()
+  backend = await module.startBackend({ staticDir: getStaticDir() })
+  backendEventsCleanup = backend.onEvent((payload) => {
+    for (const webContents of backendEventSubscribers) {
+      if (webContents.isDestroyed()) {
+        backendEventSubscribers.delete(webContents)
+        continue
+      }
+      webContents.send("backend:event", payload)
     }
-  }, 3000)
-  backendProcess = null
+  })
+}
+
+async function stopEmbeddedBackend(): Promise<void> {
+  if (!backend) return
+  const handle = backend
+  backend = null
+  backendEventsCleanup?.()
+  backendEventsCleanup = null
+  backendEventSubscribers.clear()
+  await handle.stop()
 }
 
 // ---------------------------------------------------------------------------
-// Health check
+// Protocol
 // ---------------------------------------------------------------------------
 
-function checkHealth(): Promise<boolean> {
-  return new Promise((resolve) => {
-    const req = httpGet(`${BACKEND_URL}/health`, (res) => {
-      resolve(res.statusCode === 200)
-      res.resume() // consume response data to free memory
-    })
-    req.on("error", () => resolve(false))
-    req.setTimeout(2000, () => {
-      req.destroy()
-      resolve(false)
-    })
-  })
+function isBackendPath(pathname: string): boolean {
+  return pathname === "/health" || pathname.startsWith("/api/") || pathname.startsWith("/app/")
 }
 
-async function waitForBackend(): Promise<boolean> {
-  const start = Date.now()
-  while (Date.now() - start < HEALTH_TIMEOUT_MS) {
-    if (!backendProcess) return false // process already exited
-    const ok = await checkHealth()
-    if (ok) return true
-    await new Promise((r) => setTimeout(r, HEALTH_POLL_INTERVAL_MS))
-  }
-  return false
+function viteUrlFor(requestUrl: URL): string {
+  const viteUrl = new URL(VITE_DEV_URL)
+  viteUrl.pathname = requestUrl.pathname
+  viteUrl.search = requestUrl.search
+  return viteUrl.href
+}
+
+function registerProtocolHandler(): void {
+  protocol.handle(APP_PROTOCOL, async (request) => {
+    const url = new URL(request.url)
+
+    if (!backend) {
+      return new Response(JSON.stringify({ error: "Backend not started" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+
+    const useVite = !app.isPackaged && !process.env.LATENT_INFO_STATIC_DIR
+    if (useVite && !isBackendPath(url.pathname)) {
+      return fetch(viteUrlFor(url))
+    }
+
+    return backend.handleRequest(request)
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -197,7 +187,7 @@ function createMainWindow(): BrowserWindow {
     height: 800,
     minWidth: 800,
     minHeight: 600,
-    backgroundColor: "#111110", // warm dark theme background
+    backgroundColor: "#111110",
     icon: appIconPath,
     titleBarStyle: "hiddenInset",
     trafficLightPosition: { x: 16, y: 16 },
@@ -210,13 +200,10 @@ function createMainWindow(): BrowserWindow {
     },
   })
 
-  // Show when ready to prevent white flash
   win.once("ready-to-show", () => {
     win.show()
   })
 
-  // Hide on close instead of destroying (tray keeps running).
-  // Show the tray notification first (if not yet dismissed), then hide.
   win.on("close", (event) => {
     if (!isQuitting) {
       event.preventDefault()
@@ -231,7 +218,6 @@ function createMainWindow(): BrowserWindow {
     }
   })
 
-  // Open external links in the default browser
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith("http")) {
       shell.openExternal(url)
@@ -239,20 +225,15 @@ function createMainWindow(): BrowserWindow {
     return { action: "deny" }
   })
 
-  // Load the frontend.
-  // In packaged or static-dir mode, load from the backend's static serving. In dev, use Vite.
-  const useBackend = app.isPackaged || !!process.env.LATENT_INFO_STATIC_DIR
-  const loadUrl = useBackend ? BACKEND_URL : VITE_DEV_URL
+  const loadUrl = `${APP_ORIGIN}/`
   console.log(`[gui] Loading: ${loadUrl}`)
   win.loadURL(loadUrl)
 
-  // Re-focus webview on window focus (alt-tab back) so keyboard shortcuts work
   win.on("focus", () => {
     win.webContents.focus()
   })
 
-  // Open devtools only for the real Vite-driven development flow.
-  if (!useBackend && process.env.NODE_ENV !== "test") {
+  if (!app.isPackaged && process.env.NODE_ENV !== "test") {
     win.webContents.openDevTools({ mode: "detach" })
   }
 
@@ -287,8 +268,6 @@ function createTray(): Tray {
   ])
 
   systemTray.setContextMenu(contextMenu)
-
-  // Left click opens the dashboard on macOS
   systemTray.on("click", () => {
     showMainWindow()
   })
@@ -321,7 +300,6 @@ function buildAppMenu(): void {
   const isMac = process.platform === "darwin"
 
   const template: Electron.MenuItemConstructorOptions[] = [
-    // App menu (macOS only)
     ...(isMac
       ? [
           {
@@ -340,7 +318,6 @@ function buildAppMenu(): void {
           },
         ]
       : []),
-    // File menu
     {
       label: "File",
       submenu: [
@@ -348,7 +325,6 @@ function buildAppMenu(): void {
           label: "Find",
           accelerator: "CmdOrCtrl+F",
           click: () => {
-            // Forward Cmd+F to the webview so the frontend can handle it
             mainWindow?.webContents.executeJavaScript(
               `document.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true }))`,
             )
@@ -358,7 +334,6 @@ function buildAppMenu(): void {
         isMac ? { role: "close" as const } : { role: "quit" as const },
       ],
     },
-    // Edit menu
     {
       label: "Edit",
       submenu: [
@@ -371,7 +346,6 @@ function buildAppMenu(): void {
         { role: "selectAll" as const },
       ],
     },
-    // View menu
     {
       label: "View",
       submenu: [
@@ -386,7 +360,6 @@ function buildAppMenu(): void {
         { role: "togglefullscreen" as const },
       ],
     },
-    // Window menu
     {
       label: "Window",
       submenu: [
@@ -400,7 +373,6 @@ function buildAppMenu(): void {
           : [{ role: "close" as const }]),
       ],
     },
-    // Help menu
     {
       label: "Help",
       submenu: [
@@ -461,6 +433,14 @@ ipcMain.handle(
   },
 )
 
+ipcMain.on("backend-events:subscribe", (event) => {
+  backendEventSubscribers.add(event.sender)
+})
+
+ipcMain.on("backend-events:unsubscribe", (event) => {
+  backendEventSubscribers.delete(event.sender)
+})
+
 // ---------------------------------------------------------------------------
 // Tray minimize notification
 // ---------------------------------------------------------------------------
@@ -508,24 +488,51 @@ async function showTrayNotificationOnce(win: BrowserWindow): Promise<void> {
 // App lifecycle
 // ---------------------------------------------------------------------------
 
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
   isQuitting = true
+  if (backend && !isStoppingBackend) {
+    event.preventDefault()
+    isStoppingBackend = true
+    stopEmbeddedBackend()
+      .catch((err) => console.error("[gui] Backend shutdown error:", err))
+      .finally(() => app.quit())
+  }
 })
 
-app.on("quit", () => {
-  killBackend()
-})
+function shutdownFromSignal(signal: NodeJS.Signals): void {
+  if (signalShutdown) {
+    app.exit(0)
+    return
+  }
+
+  console.log(`[gui] Received ${signal}, shutting down...`)
+  isQuitting = true
+  isStoppingBackend = true
+
+  const forceExit = setTimeout(() => {
+    console.warn("[gui] Shutdown timed out; exiting")
+    app.exit(0)
+  }, 3000)
+  forceExit.unref?.()
+
+  signalShutdown = stopEmbeddedBackend()
+    .catch((err) => console.error("[gui] Backend shutdown error:", err))
+    .finally(() => {
+      clearTimeout(forceExit)
+      app.exit(0)
+    })
+}
+
+process.once("SIGINT", shutdownFromSignal)
+process.once("SIGTERM", shutdownFromSignal)
 
 app.on("window-all-closed", () => {
-  // On macOS, keep the app running in the tray even when all windows are closed.
-  // On other platforms, quit.
   if (process.platform !== "darwin") {
     app.quit()
   }
 })
 
 app.on("activate", () => {
-  // On macOS, re-create the window when dock icon is clicked and no windows exist
   if (mainWindow === null || mainWindow.isDestroyed()) {
     mainWindow = createMainWindow()
   } else {
@@ -540,38 +547,18 @@ app.on("activate", () => {
 async function bootstrap(): Promise<void> {
   await app.whenReady()
 
-  // Set dock icon on macOS
   if (hasDock && app.dock) {
     const dockIcon = nativeImage.createFromPath(join(__dirname, "..", "icons", "app-icon-512.png"))
     app.dock.setIcon(dockIcon)
   }
 
+  console.log("[gui] Starting embedded backend...")
+  await startEmbeddedBackend()
+  registerProtocolHandler()
+  console.log("[gui] Embedded backend is ready")
+
   buildAppMenu()
-
-  // Spawn backend
-  backendProcess = spawnBackend()
-
-  // Wait for backend to become healthy
-  console.log("[gui] Waiting for backend health check...")
-  const healthy = await waitForBackend()
-
-  if (!healthy) {
-    console.error("[gui] Backend did not become healthy within timeout")
-    dialog.showErrorBox(
-      "Backend Start Failed",
-      `LatentInfo could not start the backend server within ${HEALTH_TIMEOUT_MS / 1000} seconds.\n\n` +
-        "Please check the logs and ensure port 9821 is available.",
-    )
-    app.quit()
-    return
-  }
-
-  console.log("[gui] Backend is healthy")
-
-  // Create system tray
   tray = createTray()
-
-  // Create main window
   mainWindow = createMainWindow()
 }
 
